@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      width: 360px;
+      min-height: 200px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1b26;
+      color: #c0caf5;
+    }
+
+    /* Header */
+    .header {
+      padding: 16px;
+      background: linear-gradient(135deg, #1e1f2e, #292a3e);
+      border-bottom: 1px solid #33354a;
+      text-align: center;
+    }
+
+    .header h1 {
+      font-size: 16px;
+      font-weight: 700;
+      color: #e0af68;
+      margin-bottom: 2px;
+    }
+
+    .header p {
+      font-size: 11px;
+      color: #565f89;
+    }
+
+    /* Search */
+    .search-container {
+      padding: 12px 16px;
+    }
+
+    .search-input {
+      width: 100%;
+      padding: 10px 14px;
+      background: #24253a;
+      border: 1px solid #33354a;
+      border-radius: 8px;
+      color: #c0caf5;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .search-input::placeholder {
+      color: #565f89;
+    }
+
+    .search-input:focus {
+      border-color: #7aa2f7;
+    }
+
+    /* Suggestions */
+    .suggestions {
+      list-style: none;
+      max-height: 120px;
+      overflow-y: auto;
+      margin-top: 4px;
+    }
+
+    .suggestions li {
+      padding: 8px 14px;
+      cursor: pointer;
+      font-size: 13px;
+      border-radius: 4px;
+      transition: background 0.1s;
+    }
+
+    .suggestions li:hover {
+      background: #292a3e;
+      color: #e0af68;
+    }
+
+    /* Result Card */
+    .result {
+      padding: 0 16px 16px;
+      display: none;
+    }
+
+    .result.visible { display: block; }
+
+    .card-image {
+      width: 100%;
+      max-width: 240px;
+      margin: 0 auto 12px;
+      display: block;
+      border-radius: 10px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    }
+
+    .card-name {
+      font-size: 16px;
+      font-weight: 700;
+      color: #e0af68;
+      text-align: center;
+      margin-bottom: 2px;
+    }
+
+    .card-set {
+      font-size: 11px;
+      color: #7982a9;
+      text-align: center;
+      margin-bottom: 10px;
+    }
+
+    .price-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .price-box {
+      background: #24253a;
+      border: 1px solid #33354a;
+      border-radius: 8px;
+      padding: 8px 10px;
+      text-align: center;
+    }
+
+    .price-box .label {
+      font-size: 10px;
+      color: #565f89;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .price-box .value {
+      font-size: 18px;
+      font-weight: 700;
+      color: #9ece6a;
+      margin-top: 2px;
+    }
+
+    .price-box .value.high { color: #f7768e; }
+    .price-box .value.medium { color: #e0af68; }
+
+    .links {
+      display: flex;
+      gap: 6px;
+    }
+
+    .links a {
+      flex: 1;
+      text-align: center;
+      padding: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #7aa2f7;
+      text-decoration: none;
+      background: rgba(122, 162, 247, 0.08);
+      border: 1px solid rgba(122, 162, 247, 0.15);
+      border-radius: 6px;
+      transition: all 0.15s ease;
+    }
+
+    .links a:hover {
+      background: rgba(122, 162, 247, 0.18);
+    }
+
+    /* Loading */
+    .loading {
+      text-align: center;
+      padding: 20px;
+      color: #7982a9;
+      font-size: 13px;
+      display: none;
+    }
+
+    .loading.visible { display: block; }
+
+    /* Footer */
+    .footer {
+      padding: 10px;
+      text-align: center;
+      font-size: 10px;
+      color: #33354a;
+      border-top: 1px solid #24253a;
+    }
+
+    .footer a {
+      color: #565f89;
+      text-decoration: none;
+    }
+
+    .footer a:hover {
+      color: #7aa2f7;
+    }
+
+    .footer-sep {
+      margin: 0 6px;
+      color: #33354a;
+    }
+
+    .kofi-link:hover {
+      color: #e0af68;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #33354a; border-radius: 2px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>⚔️ MTG Price Checker</h1>
+    <p>Search any Magic: The Gathering card</p>
+  </div>
+
+  <div class="search-container">
+    <input
+      type="text"
+      class="search-input"
+      id="searchInput"
+      placeholder="Search card name..."
+      autocomplete="off"
+    />
+    <ul class="suggestions" id="suggestions"></ul>
+  </div>
+
+  <div class="loading" id="loading">Loading prices...</div>
+
+  <div class="result" id="result">
+    <img class="card-image" id="cardImage" src="" alt="" />
+    <div class="card-name" id="cardName"></div>
+    <div class="card-set" id="cardSet"></div>
+    <div class="price-grid" id="priceGrid"></div>
+    <div class="links" id="links"></div>
+  </div>
+
+  <div class="footer">
+    Prices via <a href="https://scryfall.com" target="_blank">Scryfall API</a>
+    <span class="footer-sep">·</span>
+    <a href="https://ko-fi.com/tcgpricechecker" target="_blank" class="kofi-link">☕ Support</a>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

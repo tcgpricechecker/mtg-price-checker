@@ -1,0 +1,67 @@
+{
+  "manifest_version": 3,
+  "name": "MTG Card Price Checker",
+  "version": "1.4.0",
+  "description": "Hover over Magic: The Gathering card names to see current prices from multiple sources.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "mtg-price-checker@tcgpricechecker.com",
+      "strict_min_version": "109.0"
+    }
+  },
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://api.scryfall.com/*",
+    "https://open.er-api.com/*"
+  ],
+  "background": {
+    "scripts": ["src/background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.cardmarket.com/*",
+        "https://cardmarket.com/*",
+        "https://www.tcgplayer.com/*",
+        "https://shop.tcgplayer.com/*",
+        "https://edhrec.com/*",
+        "https://www.edhrec.com/*",
+        "https://www.moxfield.com/*",
+        "https://moxfield.com/*",
+        "https://archidekt.com/*",
+        "https://www.archidekt.com/*",
+        "https://www.mtggoldfish.com/*",
+        "https://scryfall.com/*",
+        "https://www.scryfall.com/*",
+        "https://www.reddit.com/*",
+        "https://old.reddit.com/*",
+        "https://reddit.com/*",
+        "https://mtg.fandom.com/*",
+        "https://tappedout.net/*",
+        "https://www.tappedout.net/*"
+      ],
+      "js": [
+        "src/content.js"
+      ],
+      "css": [
+        "src/content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
