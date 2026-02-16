@@ -11,6 +11,157 @@
 //   - All users see TCGPlayer prices, converted to their local currency
 //   - Scryfall prices used as fallback when TCGCSV unavailable
 
+// ═══════════════════════════════════════════
+// SENTRY ERROR TRACKING
+// ═══════════════════════════════════════════
+const SENTRY_DSN = 'https://688c325cc3bafb816f252807c6348269@o4510896101720064.ingest.de.sentry.io/4510896119218256';
+const SENTRY_PROJECT_ID = '4510896119218256';
+const SENTRY_KEY = '688c325cc3bafb816f252807c6348269';
+const SENTRY_HOST = 'o4510896101720064.ingest.de.sentry.io';
+const EXTENSION_VERSION = chrome.runtime.getManifest().version;
+
+// Send error to Sentry
+async function sentryCaptureException(error, context = {}) {
+  try {
+    const envelope = createSentryEnvelope(error, context);
+    await fetch(`https://${SENTRY_HOST}/api/${SENTRY_PROJECT_ID}/envelope/`, {
+      method: 'POST',
+      body: envelope
+    });
+  } catch (e) {
+    // Silently fail - don't cause more errors
+    console.error('[Sentry] Failed to send:', e);
+  }
+}
+
+// Send message/warning to Sentry
+async function sentryCaptureMessage(message, level = 'info', context = {}) {
+  try {
+    const envelope = createSentryEnvelope(new Error(message), { ...context, level });
+    await fetch(`https://${SENTRY_HOST}/api/${SENTRY_PROJECT_ID}/envelope/`, {
+      method: 'POST',
+      body: envelope
+    });
+  } catch (e) {
+    console.error('[Sentry] Failed to send:', e);
+  }
+}
+
+// Create Sentry envelope format
+function createSentryEnvelope(error, context = {}) {
+  const eventId = crypto.randomUUID().replace(/-/g, '');
+  const timestamp = Date.now() / 1000;
+  
+  const event = {
+    event_id: eventId,
+    timestamp: timestamp,
+    platform: 'javascript',
+    level: context.level || 'error',
+    release: `mtg-price-checker@${EXTENSION_VERSION}`,
+    environment: 'production',
+    tags: {
+      extension_version: EXTENSION_VERSION,
+      ...context.tags
+    },
+    exception: {
+      values: [{
+        type: error.name || 'Error',
+        value: error.message || String(error),
+        stacktrace: error.stack ? parseStackTrace(error.stack) : undefined
+      }]
+    },
+    extra: {
+      ...context.extra
+    }
+  };
+
+  // Add browser info if available
+  if (typeof navigator !== 'undefined') {
+    event.contexts = {
+      browser: {
+        name: getBrowserName(),
+        version: getBrowserVersion()
+      }
+    };
+  }
+
+  const header = JSON.stringify({
+    event_id: eventId,
+    sent_at: new Date().toISOString(),
+    dsn: SENTRY_DSN
+  });
+  
+  const itemHeader = JSON.stringify({
+    type: 'event',
+    content_type: 'application/json'
+  });
+
+  return `${header}\n${itemHeader}\n${JSON.stringify(event)}`;
+}
+
+// Parse stack trace into Sentry format
+function parseStackTrace(stack) {
+  if (!stack) return undefined;
+  
+  const frames = stack.split('\n').slice(1).map(line => {
+    const match = line.match(/at\s+(?:(.+?)\s+\()?(.+?):(\d+):(\d+)\)?/);
+    if (match) {
+      return {
+        function: match[1] || '?',
+        filename: match[2],
+        lineno: parseInt(match[3], 10),
+        colno: parseInt(match[4], 10)
+      };
+    }
+    return { function: line.trim(), filename: '?' };
+  }).filter(f => f.filename !== '?');
+  
+  return { frames: frames.reverse() };
+}
+
+// Get browser name
+function getBrowserName() {
+  const ua = navigator.userAgent;
+  if (ua.includes('Firefox')) return 'Firefox';
+  if (ua.includes('Edg')) return 'Edge';
+  if (ua.includes('Chrome')) return 'Chrome';
+  if (ua.includes('Safari')) return 'Safari';
+  return 'Unknown';
+}
+
+// Get browser version
+function getBrowserVersion() {
+  const ua = navigator.userAgent;
+  const match = ua.match(/(Firefox|Edg|Chrome|Safari)\/(\d+)/);
+  return match ? match[2] : 'Unknown';
+}
+
+// Global error handlers
+self.addEventListener('error', (event) => {
+  sentryCaptureException(event.error || new Error(event.message), {
+    extra: { 
+      filename: event.filename,
+      lineno: event.lineno,
+      colno: event.colno 
+    }
+  });
+});
+
+self.addEventListener('unhandledrejection', (event) => {
+  const error = event.reason instanceof Error 
+    ? event.reason 
+    : new Error(String(event.reason));
+  sentryCaptureException(error, {
+    tags: { type: 'unhandledrejection' }
+  });
+});
+
+console.log(`[MTG Price Checker] v${EXTENSION_VERSION} - Error tracking enabled`);
+
+// ═══════════════════════════════════════════
+// END SENTRY
+// ═══════════════════════════════════════════
+
 // ─── CACHE ───
 const SCRYFALL_CACHE = new Map();
 const CACHE_TTL = 30 * 60 * 1000;
@@ -145,13 +296,23 @@ async function fetchExchangeRates() {
   }
   try {
     const r = await fetch('https://open.er-api.com/v6/latest/USD');
+    if (!r.ok) {
+      sentryCaptureMessage(`Exchange Rate API Error: ${r.status}`, 'warning', {
+        extra: { status: r.status }
+      });
+      return { USD: 1, EUR: 0.92, GBP: 0.79, CAD: 1.36, AUD: 1.53, JPY: 149, CHF: 0.88 };
+    }
     const data = await r.json();
     if (data.result === 'success' && data.rates) {
       exchangeRates = { rates: data.rates, ts: Date.now() };
       console.log('[MTG-PC] Exchange rates loaded');
       return data.rates;
     }
-  } catch (e) {}
+  } catch (e) {
+    sentryCaptureException(e, {
+      tags: { type: 'exchange_rate_error' }
+    });
+  }
   return { USD: 1, EUR: 0.92, GBP: 0.79, CAD: 1.36, AUD: 1.53, JPY: 149, CHF: 0.88 };
 }
 
@@ -174,12 +335,20 @@ async function getTcgcsvGroups() {
   tcgcsvGroupsPromise = (async () => {
     try {
       const res = await fetch(`https://tcgcsv.com/tcgplayer/${MTG_CATEGORY_ID}/groups`);
-      if (!res.ok) return null;
+      if (!res.ok) {
+        sentryCaptureMessage(`TCGCSV Groups API Error: ${res.status}`, 'warning', {
+          extra: { status: res.status }
+        });
+        return null;
+      }
       const data = await res.json();
       if (!data.success || !data.results) return null;
       tcgcsvGroups = data.results;
       return tcgcsvGroups;
     } catch (e) {
+      sentryCaptureException(e, {
+        tags: { type: 'tcgcsv_error', endpoint: 'groups' }
+      });
       tcgcsvGroupsPromise = null;
       return null;
     }
@@ -622,9 +791,20 @@ async function processQueue() {
       if (r.ok) {
         req.resolve(await r.json());
       } else {
+        // Log server errors (5xx) to Sentry - not 404s (those are normal)
+        if (r.status >= 500) {
+          sentryCaptureMessage(`API Error: ${r.status} from ${new URL(req.url).hostname}`, 'error', {
+            extra: { url: req.url, status: r.status, statusText: r.statusText }
+          });
+        }
         req.resolve(null);
       }
     } catch (e) {
+      // Network errors - log to Sentry
+      sentryCaptureException(e, {
+        tags: { type: 'network_error' },
+        extra: { url: req.url }
+      });
       req.resolve(null);
     }
   }

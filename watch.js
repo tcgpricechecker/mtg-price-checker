@@ -7,6 +7,7 @@ const os = require('os');
 
 // ─── CONFIGURATION ───
 const SHARED_SRC = path.join(__dirname, 'shared', 'src');
+const SHARED_ICONS = path.join(__dirname, 'shared', 'icons');
 const DOWNLOADS_DIR = path.join(os.homedir(), 'Downloads');
 const RELOAD_FILE = path.join(__dirname, 'dist', 'chrome', '.reload');
 
@@ -116,6 +117,27 @@ function extractZip(zipPath) {
       
       log(`✅ Copied ${copied} files from ZIP → shared/src/`);
       
+      // Also check for shared/icons
+      const sharedIconsPath = sharedSrcPath.replace(/src$/, 'icons');
+      if (fs.existsSync(sharedIconsPath)) {
+        const iconFiles = fs.readdirSync(sharedIconsPath);
+        let iconsCopied = 0;
+        
+        for (const file of iconFiles) {
+          const srcFile = path.join(sharedIconsPath, file);
+          const destFile = path.join(SHARED_ICONS, file);
+          
+          if (fs.statSync(srcFile).isFile()) {
+            fs.copyFileSync(srcFile, destFile);
+            iconsCopied++;
+          }
+        }
+        
+        if (iconsCopied > 0) {
+          log(`🎨 Copied ${iconsCopied} icons from ZIP → shared/icons/`);
+        }
+      }
+      
       // Also check for package.json to sync version
       const pkgPath = findPackageJson(tempDir);
       if (pkgPath) {
@@ -202,13 +224,22 @@ function isRelevantZip(filename) {
   return ZIP_PATTERNS.some(pattern => lower.includes(pattern));
 }
 
-// ─── WATCH SHARED/SRC ───
+// ─── WATCH SHARED/SRC AND SHARED/ICONS ───
 function watchShared() {
   log('👀 Watching shared/src/ for changes...');
   
   fs.watch(SHARED_SRC, { recursive: true }, (eventType, filename) => {
     if (filename && !filename.startsWith('.')) {
-      log(`📝 Changed: ${filename}`);
+      log(`📝 Changed: src/${filename}`);
+      scheduleBuild();
+    }
+  });
+  
+  log('👀 Watching shared/icons/ for changes...');
+  
+  fs.watch(SHARED_ICONS, { recursive: true }, (eventType, filename) => {
+    if (filename && !filename.startsWith('.')) {
+      log(`🎨 Changed: icons/${filename}`);
       scheduleBuild();
     }
   });
@@ -268,14 +299,16 @@ function checkDownloadsOnStart() {
 
 // ─── MAIN ───
 console.log('');
-console.log('🚀 MTG Price Checker - Watch Mode v2');
+console.log('🚀 MTG Price Checker - Watch Mode v2.1');
 console.log('═══════════════════════════════════════════');
 console.log('');
-console.log('  Supported inputs:');
-console.log('    • background.js / background');
-console.log('    • content.js / content');
-console.log('    • content.css');
-console.log('    • popup.js / popup.html');
+console.log('  Watches:');
+console.log('    • shared/src/    (code changes)');
+console.log('    • shared/icons/  (icon changes)');
+console.log('    • Downloads/     (files & ZIPs)');
+console.log('');
+console.log('  Supported Downloads:');
+console.log('    • background.js / content.js / popup.*');
 console.log('    • mtg-price-checker*.zip');
 console.log('');
 console.log('  Just download from Claude,');
