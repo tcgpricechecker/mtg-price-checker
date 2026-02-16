@@ -20,9 +20,44 @@ const SENTRY_KEY = '688c325cc3bafb816f252807c6348269';
 const SENTRY_HOST = 'o4510896101720064.ingest.de.sentry.io';
 const EXTENSION_VERSION = chrome.runtime.getManifest().version;
 
+// Rate limiting: max 3 same errors per day
+const SENTRY_RATE_LIMIT = 3;
+const SENTRY_RATE_WINDOW = 24 * 60 * 60 * 1000; // 24 hours
+const sentryRateMap = new Map(); // key -> { count, firstSeen }
+
+function checkSentryRateLimit(key) {
+  const now = Date.now();
+  const entry = sentryRateMap.get(key);
+  
+  if (!entry) {
+    sentryRateMap.set(key, { count: 1, firstSeen: now });
+    return true; // Allow
+  }
+  
+  // Reset if window expired
+  if (now - entry.firstSeen > SENTRY_RATE_WINDOW) {
+    sentryRateMap.set(key, { count: 1, firstSeen: now });
+    return true; // Allow
+  }
+  
+  // Check limit
+  if (entry.count >= SENTRY_RATE_LIMIT) {
+    return false; // Block
+  }
+  
+  entry.count++;
+  return true; // Allow
+}
+
 // Send error to Sentry
 async function sentryCaptureException(error, context = {}) {
   try {
+    const rateKey = `${error.name}:${error.message}`;
+    if (!checkSentryRateLimit(rateKey)) {
+      console.log('[Sentry] Rate limited:', rateKey);
+      return;
+    }
+    
     const envelope = createSentryEnvelope(error, context);
     await fetch(`https://${SENTRY_HOST}/api/${SENTRY_PROJECT_ID}/envelope/`, {
       method: 'POST',
@@ -37,6 +72,12 @@ async function sentryCaptureException(error, context = {}) {
 // Send message/warning to Sentry
 async function sentryCaptureMessage(message, level = 'info', context = {}) {
   try {
+    const rateKey = `msg:${message}`;
+    if (!checkSentryRateLimit(rateKey)) {
+      console.log('[Sentry] Rate limited:', rateKey);
+      return;
+    }
+    
     const envelope = createSentryEnvelope(new Error(message), { ...context, level });
     await fetch(`https://${SENTRY_HOST}/api/${SENTRY_PROJECT_ID}/envelope/`, {
       method: 'POST',
