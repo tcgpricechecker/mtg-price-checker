@@ -175,7 +175,9 @@
 }
 
 /* Default display for visible rows */
-#mtg-price-popup .mtg-row-normal,
+#mtg-price-popup .mtg-row-low,
+#mtg-price-popup .mtg-row-mid,
+#mtg-price-popup .mtg-row-market,
 #mtg-price-popup .mtg-row-foil {
   display: flex;
 }
@@ -299,4 +301,29 @@
   display: inline-block;
   padding: 2px 4px;
   border-radius: 3px;
+}
+
+/* ─── Foil Badge with Rainbow Effect ─── */
+.mtg-foil-badge {
+  background: linear-gradient(
+    90deg,
+    #ff6b6b,
+    #feca57,
+    #48dbfb,
+    #ff9ff3,
+    #54a0ff,
+    #5f27cd,
+    #ff6b6b
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: mtg-foil-shimmer 3s linear infinite;
+  font-weight: 600;
+}
+
+@keyframes mtg-foil-shimmer {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
 }

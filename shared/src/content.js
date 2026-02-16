@@ -1,12 +1,12 @@
-// MTG Card Price Checker - Content Script v18
-// Displays card prices from Scryfall when hovering over card links on MTG websites.
-// EUR prices come natively from Scryfall; other currencies are converted from USD.
+// MTG Card Price Checker - Content Script v19
+// Displays card prices from TCGCSV (TCGPlayer) when hovering over card links on MTG websites.
+// All prices are in USD from TCGPlayer, converted to user's local currency.
 //
-// v18 changes:
-//   - EDHREC: Added post-scan cleanup pass to remove over-stamped containers.
-//     First-card-in-section could stamp all the way up to layout containers before
-//     sibling cards existed to stop it. Cleanup now removes stamps from any element
-//     whose descendants contain stamps for multiple distinct cards.
+// v19 changes:
+//   - TCGCSV integration: Real TCGPlayer prices (Low/Mid/High) instead of Scryfall Trend
+//   - Popup shows Low/Mid/High/Foil for cards with TCGCSV data
+//   - Fallback to Scryfall Trend for cards without TCGCSV data
+//   - Source label shows "TCGPlayer" or "TCGPlayer USD" for non-USD users
 
 (function () {
   'use strict';
@@ -718,32 +718,104 @@
     $('.mtg-popup-set').textContent = data.set + ' (' + data.setCode + ')';
     $('.mtg-popup-type').textContent = data.typeLine;
 
-    const normal = getPrice(data.prices, 'normal');
-    const foil = getPrice(data.prices, 'foil');
+    const p = data.prices || {};
+    const hasTcgcsv = p.source === 'tcgcsv' && (
+      p.low != null || p.mid != null || p.high != null ||
+      p.lowFoil != null || p.midFoil != null || p.highFoil != null
+    );
     const sym = CUR_SYM[userCurrency] || userCurrency;
 
-    const hasNativeEur = userCurrency === 'EUR' && (data.prices.eur != null || data.prices.eurFoil != null);
-    const source = hasNativeEur ? 'Scryfall (EUR)' : (userCurrency === 'USD' ? 'TCGPlayer' : 'TCGPlayer ≈');
-    $('.mtg-section-title').textContent = sym + ' ' + userCurrency + ' (' + source + ')';
+    // Helper to convert USD to user currency
+    const convert = (usdVal) => {
+      if (usdVal == null) return null;
+      if (userCurrency === 'USD') return usdVal;
+      return usdVal * exchangeRate;
+    };
 
-    const normalEl = $('[data-price="normal"]');
-    const normalRow = $('.mtg-row-normal');
-    if (normal != null) {
-      normalEl.textContent = fmtPrice(normal);
-      normalEl.className = 'mtg-price-value' + (normal >= 10 ? ' mtg-price-high' : normal >= 2 ? ' mtg-price-medium' : '');
-      normalRow.style.display = '';
+    // Helper to set price in element with styling
+    const setPrice = (el, row, val, label) => {
+      if (val != null) {
+        el.textContent = fmtPrice(val);
+        el.className = 'mtg-price-value' + (val >= 10 ? ' mtg-price-high' : val >= 2 ? ' mtg-price-medium' : '');
+        row.style.display = 'flex';
+      } else {
+        row.style.display = 'none';
+      }
+    };
+
+    // Build source label
+    let sourceLabel;
+    if (hasTcgcsv) {
+      sourceLabel = userCurrency === 'USD' ? 'TCGPlayer' : 'TCGPlayer USD';
     } else {
-      normalRow.style.display = 'none';
+      sourceLabel = 'Scryfall (Trend)';
     }
+    
+    // Check for foil type from card data
+    const isEtched = data.isEtched || (data.finishes && data.finishes.includes('etched') && !data.finishes.includes('nonfoil'));
+    const isFoilOnlyFinish = data.finishes && data.finishes.length === 1 && (data.finishes[0] === 'foil' || data.finishes[0] === 'etched');
+    
+    $('.mtg-section-title').textContent = sym + ' ' + userCurrency + ' (' + sourceLabel + ')';
 
-    const foilEl = $('[data-price="foil"]');
-    const foilRow = $('.mtg-row-foil');
-    if (foil != null) {
-      foilEl.textContent = fmtPrice(foil);
-      foilEl.className = 'mtg-price-value' + (foil >= 10 ? ' mtg-price-high' : foil >= 2 ? ' mtg-price-medium' : '');
-      foilRow.style.display = '';
+    // ─── PRICE DISPLAY ───
+    if (hasTcgcsv) {
+      // Check if this is a foil-only card (no normal prices, only foil prices)
+      const hasNormalPrices = p.low != null || p.mid != null || p.market != null;
+      const hasFoilPrices = p.lowFoil != null || p.midFoil != null || p.marketFoil != null;
+      const isFoilOnly = !hasNormalPrices && hasFoilPrices;
+
+      let low, mid, market, foil;
+
+      if (isFoilOnly) {
+        // Foil-only card: show foil prices as main prices
+        low = convert(p.lowFoil);
+        mid = convert(p.midFoil);
+        market = convert(p.marketFoil);
+        foil = null; // Don't show separate foil row
+
+        // Update section title with foil badge
+        const titleEl = $('.mtg-section-title');
+        const foilType = isEtched ? 'Foil Etched' : 'Foil';
+        titleEl.innerHTML = sym + ' ' + userCurrency + ' (' + sourceLabel + ' · <span class="mtg-foil-badge">' + foilType + '</span>)';
+      } else {
+        // Normal card with optional foil variant
+        low = convert(p.low);
+        mid = convert(p.mid);
+        market = convert(p.market);
+        foil = convert(p.midFoil);
+      }
+
+      // Reset mid label to "Avg" (might have been changed to "Trend" by fallback)
+      const midLabel = $('.mtg-row-mid .mtg-price-label');
+      if (midLabel) midLabel.textContent = 'Avg';
+
+      setPrice($('[data-price="low"]'), $('.mtg-row-low'), low);
+      setPrice($('[data-price="mid"]'), $('.mtg-row-mid'), mid);
+      setPrice($('[data-price="market"]'), $('.mtg-row-market'), market);
+      setPrice($('[data-price="foil"]'), $('.mtg-row-foil'), foil);
     } else {
-      foilRow.style.display = 'none';
+      // Fallback to Scryfall trend prices
+      const normal = getPrice(p, 'normal');
+      const foil = getPrice(p, 'foil');
+
+      // Check if this card has no TCGPlayer listings
+      const noListings = p.source === 'tcgcsv-no-listings';
+
+      if (noListings) {
+        sourceLabel = 'No TCGPlayer listings';
+      }
+
+      $('.mtg-section-title').textContent = sym + ' ' + userCurrency + ' (' + sourceLabel + ')';
+
+      // Hide Low/Market rows, only show as combined "normal" price
+      $('.mtg-row-low').style.display = 'none';
+      $('.mtg-row-market').style.display = 'none';
+      
+      // Use mid row for the trend price, relabel it
+      const midLabel = $('.mtg-row-mid .mtg-price-label');
+      if (midLabel) midLabel.textContent = 'Trend';
+      setPrice($('[data-price="mid"]'), $('.mtg-row-mid'), normal);
+      setPrice($('[data-price="foil"]'), $('.mtg-row-foil'), foil);
     }
 
     for (const [cls, key] of [['scryfall','scryfall'],['cardmarket','cardmarket'],['tcgplayer','tcgplayer'],['ebay','ebay']]) {
@@ -910,8 +982,10 @@
           '</div>' +
           '<div class="mtg-popup-prices">' +
             '<div class="mtg-section-title"></div>' +
-            '<div class="mtg-price-row mtg-row-normal"><span class="mtg-price-label">Trend</span><span class="mtg-price-value" data-price="normal"></span></div>' +
-            '<div class="mtg-price-row mtg-row-foil"><span class="mtg-price-label">Foil</span><span class="mtg-price-value" data-price="foil"></span></div>' +
+            '<div class="mtg-price-row mtg-row-low"><span class="mtg-price-label">Min</span><span class="mtg-price-value" data-price="low"></span></div>' +
+            '<div class="mtg-price-row mtg-row-mid"><span class="mtg-price-label">Avg</span><span class="mtg-price-value" data-price="mid"></span></div>' +
+            '<div class="mtg-price-row mtg-row-market"><span class="mtg-price-label">Sold</span><span class="mtg-price-value" data-price="market"></span></div>' +
+            '<div class="mtg-price-row mtg-row-foil"><span class="mtg-price-label"><span class="mtg-foil-badge">Foil</span></span><span class="mtg-price-value" data-price="foil"></span></div>' +
           '</div>' +
           '<div class="mtg-popup-oracle" style="display:none;"></div>' +
           '<div class="mtg-popup-links">' +
