@@ -20,8 +20,10 @@ let cacheDirty = false;
 
 // ─── TCGCSV CACHE ───
 const TCGCSV_CACHE = new Map();
-const TCGCSV_CACHE_TTL = 60 * 60 * 1000;
+const TCGCSV_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours (prices don't change often)
+const TCGCSV_CACHE_MAX = 30; // Max sets to keep in memory
 const MTG_CATEGORY_ID = 1;
+let tcgcsvCacheDirty = false;
 
 // ─── GLOBAL REQUEST QUEUE ───
 const REQUEST_QUEUE = [];
@@ -41,9 +43,11 @@ const EXCHANGE_RATE_TTL = 24 * 60 * 60 * 1000;
 // ═══════════════════════════════════════════
 (async function loadPersistentCache() {
   try {
-    const data = await chrome.storage.local.get('mtgCache');
+    // Load Scryfall cache
+    const data = await chrome.storage.local.get(['mtgCache', 'tcgcsvCache']);
+    const now = Date.now();
+    
     if (data.mtgCache && Array.isArray(data.mtgCache)) {
-      const now = Date.now();
       let loaded = 0;
       for (const [key, entry] of data.mtgCache) {
         if (entry.ts && (now - entry.ts) < CACHE_TTL) {
@@ -51,7 +55,25 @@ const EXCHANGE_RATE_TTL = 24 * 60 * 60 * 1000;
           loaded++;
         }
       }
-      if (loaded > 0) console.log('[MTG-PC] Loaded', loaded, 'cached entries');
+      if (loaded > 0) console.log('[MTG-PC] Loaded', loaded, 'Scryfall cache entries');
+    }
+    
+    // Load TCGCSV cache
+    if (data.tcgcsvCache && Array.isArray(data.tcgcsvCache)) {
+      let loaded = 0;
+      for (const [groupId, entry] of data.tcgcsvCache) {
+        if (entry.ts && (now - entry.ts) < TCGCSV_CACHE_TTL) {
+          // Reconstruct the Map for prices
+          const priceMap = new Map(entry.priceEntries || []);
+          TCGCSV_CACHE.set(groupId, {
+            ts: entry.ts,
+            prices: priceMap,
+            products: entry.products || []
+          });
+          loaded++;
+        }
+      }
+      if (loaded > 0) console.log('[MTG-PC] Loaded', loaded, 'TCGCSV cache entries');
     }
   } catch (e) {}
 })();
@@ -59,11 +81,31 @@ const EXCHANGE_RATE_TTL = 24 * 60 * 60 * 1000;
 setInterval(persistCache, CACHE_PERSIST_INTERVAL);
 
 async function persistCache() {
-  if (!cacheDirty) return;
   try {
-    const entries = [...SCRYFALL_CACHE.entries()];
-    await chrome.storage.local.set({ mtgCache: entries });
-    cacheDirty = false;
+    const updates = {};
+    
+    if (cacheDirty) {
+      updates.mtgCache = [...SCRYFALL_CACHE.entries()];
+      cacheDirty = false;
+    }
+    
+    if (tcgcsvCacheDirty) {
+      // Convert TCGCSV cache - need to serialize the price Map
+      const tcgcsvEntries = [];
+      for (const [groupId, entry] of TCGCSV_CACHE.entries()) {
+        tcgcsvEntries.push([groupId, {
+          ts: entry.ts,
+          priceEntries: [...entry.prices.entries()],
+          products: entry.products
+        }]);
+      }
+      updates.tcgcsvCache = tcgcsvEntries;
+      tcgcsvCacheDirty = false;
+    }
+    
+    if (Object.keys(updates).length > 0) {
+      await chrome.storage.local.set(updates);
+    }
   } catch (e) {}
 }
 
@@ -339,8 +381,9 @@ async function fetchTcgcsvPrices(productId, setName, cardName = null) {
 
     // Cache
     TCGCSV_CACHE.set(groupId, { ts: Date.now(), prices: priceMap, products: products });
+    tcgcsvCacheDirty = true;
 
-    if (TCGCSV_CACHE.size > 50) {
+    if (TCGCSV_CACHE.size > TCGCSV_CACHE_MAX) {
       const oldest = TCGCSV_CACHE.keys().next().value;
       TCGCSV_CACHE.delete(oldest);
     }
@@ -516,6 +559,7 @@ async function fetchTcgcsvPricesByName(cardName, setName, frameEffects = [], fin
       // Cache
       cached = { ts: Date.now(), prices: priceMap, products: productsData.results };
       TCGCSV_CACHE.set(groupId, cached);
+      tcgcsvCacheDirty = true;
     } catch (e) {
       return null;
     }
