@@ -790,13 +790,14 @@
         return;
       }
 
-      if (res.success) {
-        renderPrice(res.data);
-        setState('content');
-      } else {
+      if (!res.success) {
         popup.querySelector('.mtg-popup-error span').textContent = '❌ "' + info.name + '" not found';
         setState('error');
+        return;
       }
+
+      renderPrice(res.data);
+      setState('content');
 
       // After showing initial result, refine with Cardmarket product ID if available
       const cmProductId = await cmIdPromise;

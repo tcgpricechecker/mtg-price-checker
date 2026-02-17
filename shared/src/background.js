@@ -219,7 +219,7 @@ let tcgcsvCacheDirty = false;
 
 // ─── GLOBAL REQUEST QUEUE ───
 const REQUEST_QUEUE = [];
-const RATE_MS = 100;
+const RATE_MS = 75;
 let lastRequest = 0;
 let queueProcessing = false;
 let activeLookupGen = 0;
@@ -269,6 +269,9 @@ const EXCHANGE_RATE_TTL = 24 * 60 * 60 * 1000;
       if (loaded > 0) console.log('[MTG-PC] Loaded', loaded, 'TCGCSV cache entries');
     }
   } catch (e) {}
+
+  // Prefetch TCGCSV groups so first lookup doesn't pay the ~300ms penalty
+  getTcgcsvGroups();
 })();
 
 setInterval(persistCache, CACHE_PERSIST_INTERVAL);
@@ -696,6 +699,8 @@ async function fetchTcgcsvPricesDirectByProductId(productId, setHints) {
   for (const [gid, cached] of TCGCSV_CACHE.entries()) {
     if (Date.now() - cached.ts < TCGCSV_CACHE_TTL && cached.prices.has(productId)) {
       const product = findProduct(cached.products);
+      console.log(`[TCGCSV-Direct] Product ${productId} found in cached group ${gid}` +
+        (product ? `: "${product.name}"` : ''));
       return { prices: cached.prices.get(productId), product, groupName: null };
     }
   }
@@ -709,6 +714,8 @@ async function fetchTcgcsvPricesDirectByProductId(productId, setHints) {
   for (const hint of setHints) {
     if (!hint) continue;
     const candidates = matchAllGroups(groups, hint);
+    console.log(`[TCGCSV-Direct] Hint "${hint}" matched ${candidates.length} groups:`,
+      candidates.map(c => `${c.name} (${c.score.toFixed(2)})`).join(', '));
 
     for (const { groupId, name: groupName } of candidates) {
       if (triedGroups.has(groupId)) continue;
@@ -719,6 +726,8 @@ async function fetchTcgcsvPricesDirectByProductId(productId, setHints) {
       if (cached && Date.now() - cached.ts < TCGCSV_CACHE_TTL) {
         if (cached.prices.has(productId)) {
           const product = findProduct(cached.products);
+          console.log(`[TCGCSV-Direct] Product ${productId} found in cached group "${groupName}"` +
+            (product ? `: "${product.name}"` : ''));
           return { prices: cached.prices.get(productId), product, groupName };
         }
         continue;
@@ -772,13 +781,18 @@ async function fetchTcgcsvPricesDirectByProductId(productId, setHints) {
         // Check for our product
         if (priceMap.has(productId)) {
           const product = findProduct(products);
+          console.log(`[TCGCSV-Direct] Product ${productId} found in group "${groupName}" (${priceMap.size} products)` +
+            (product ? `: "${product.name}"` : ''));
           return { prices: priceMap.get(productId), product, groupName };
         }
+        console.log(`[TCGCSV-Direct] Product ${productId} NOT in group "${groupName}" (${priceMap.size} products)`);
       } catch (e) {
+        console.log(`[TCGCSV-Direct] Error fetching group "${groupName}":`, e.message);
       }
     }
   }
 
+  console.log(`[TCGCSV-Direct] Product ${productId} not found in any matching group`);
   return null;
 }
 
@@ -1067,6 +1081,7 @@ async function handleLookup(msg) {
 
   // Apply tcgplayerId override (from TCG ID fallback - card info from Scryfall, price ID from URL)
   if (overrideTcgPlayerId) {
+    console.log(`[handleLookup] Overriding tcgplayerId ${card.tcgplayerId} → ${overrideTcgPlayerId} for TCGCSV enrichment`);
     card.tcgplayerId = overrideTcgPlayerId;
   }
 
@@ -1086,6 +1101,10 @@ async function handleLookup(msg) {
         // Enhance card with TCGCSV product info (more accurate than Scryfall fallback)
         const product = tcgcsvResult.product;
         if (product) {
+          console.log('[handleLookup] Enhancing card with TCGCSV product:', JSON.stringify({
+            name: product.name, cleanName: product.cleanName, imageUrl: product.imageUrl,
+            url: product.url, number: product.number
+          }));
           card.name = product.cleanName || card.name;
           card.set = tcgcsvResult.groupName || card.set;
           // Parse variant details from full product name
@@ -1140,7 +1159,7 @@ async function handleLookup(msg) {
   // Rebuild eBay link with potentially enhanced card name/set
   card.links.ebay = buildEbayLink(card.name, card.set);
 
-  return { success: true, data: card };
+  return { success: true, data: card, printingMatched: result.printingMatched ?? true };
 }
 
 function buildEbayLink(name, set) {
@@ -1242,12 +1261,16 @@ async function lookupByName(name, lang, setHint, variant, cardmarketProductId) {
   }
 
   let match = card;
+  let printingMatched = false;
   if (setHint) {
     const printing = await findPrinting(card.name, setHint, variant);
-    if (printing) match = printing;
+    if (printing) {
+      match = printing;
+      printingMatched = true;
+    }
   }
 
-  const result = { success: true, data: formatCard(match) };
+  const result = { success: true, data: formatCard(match), printingMatched };
   setCache(key, result);
   return result;
 }
@@ -1263,7 +1286,21 @@ async function findPrinting(cardName, setHint, variant) {
       return null;
     }
 
-    const printings = data.data;
+    let printings = data.data;
+
+    // Paginate if first page didn't contain all results.
+    // Only relevant for cards with 175+ printings (basic lands, Lightning Bolt, etc.)
+    if (data.has_more && data.next_page) {
+      let nextUrl = data.next_page;
+      const MAX_PAGES = 5;
+      for (let page = 1; page < MAX_PAGES && nextUrl; page++) {
+        const pageData = await queuedFetch(nextUrl);
+        if (!pageData?.data?.length) break;
+        printings = printings.concat(pageData.data);
+        nextUrl = pageData.has_more ? pageData.next_page : null;
+      }
+    }
+
     console.log(`[findPrinting] Found ${printings.length} printings for "${cardName}", hint: "${setHint}"`);
     
     // Basic normalization: remove punctuation, lowercase, collapse spaces
@@ -1392,7 +1429,14 @@ async function findPrinting(cardName, setHint, variant) {
           return extraKeyWords.every(kw => cmUrl.includes(kw));
         });
         if (cmMatches.length > 0 && cmMatches.length < setMatches.length) {
+          console.log(`[findPrinting] Extra-keyword tie-breaker: ${setMatches.length} → ${cmMatches.length} (extra keywords: ${extraKeyWords.join(', ')})`);
           setMatches = cmMatches;
+        } else {
+          // Debug: show what cardmarket URLs look like for first few matches
+          console.log(`[findPrinting] Tie-breaker missed (extra keywords: ${extraKeyWords.join(', ')}). Sample CM URLs:`);
+          setMatches.slice(0, 3).forEach(c => {
+            console.log(`  #${c.collector_number}: ${(c.purchase_uris?.cardmarket || 'none').substring(0, 120)}`);
+          });
         }
       }
     }

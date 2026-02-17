@@ -1,6 +1,6 @@
 {
   "name": "mtg-price-checker",
-  "version": "1.5.6",
+  "version": "1.5.5",
   "description": "Multi-browser extension for Magic: The Gathering card price checking",
   "scripts": {
     "build": "node build.js all",
