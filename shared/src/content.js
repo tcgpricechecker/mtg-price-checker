@@ -121,7 +121,9 @@
         const href = el.href || '';
         const m = href.match(/\/Singles\/([^/]+)\/([^/?#]+)/);
         if (m) {
-          const setSlug = decodeURIComponent(m[1]).replace(/-/g, ' ').trim();
+          let setSlug = decodeURIComponent(m[1]).replace(/-/g, ' ').trim();
+          // Remove "Magic The Gathering" prefix that Cardmarket adds to some sets
+          setSlug = setSlug.replace(/^Magic\s+The\s+Gathering\s+/i, '').trim();
           let cardSlug = decodeURIComponent(m[2]).replace(/-/g, ' ').trim();
           let variant = null;
           const vMatch = cardSlug.match(/\s+V\s*\.?\s*(\d+)\s*$/i);
@@ -132,7 +134,7 @@
           const langMatch = href.match(/cardmarket\.com\/(\w{2})\//);
           const lang = langMatch ? langMatch[1] : 'en';
           if (cardSlug.length >= 2) {
-            return { name: cardSlug, lang, setHint: setSlug, variant };
+            return { name: cardSlug, lang, setHint: setSlug, variant, productUrl: href };
           }
         }
         const text = cardText(el);
@@ -277,18 +279,100 @@
   function extractTcgPlayer(el) {
     const href = el.href || '';
     const m = href.match(/\/product\/(\d+)/);
-    if (m) return { name: cardText(el) || 'Unknown', tcgplayerId: m[1], lang: 'en' };
-    return null;
+    if (!m) return null;
+
+    const slugInfo = parseTcgPlayerSlug(href);
+
+    // Try multiple sources for card name (most to least reliable)
+    const name = cardText(el)
+      || tcgImageAlt(el)
+      || slugInfo?.nameFallback
+      || 'Unknown';
+
+    // Derive setHint: strip card name from slug to isolate set name.
+    // Generic approach — no hardcoded set prefixes needed.
+    let setHint = null;
+    if (slugInfo?.cleanSlug && name !== 'Unknown') {
+      setHint = deriveSetHintFromSlug(slugInfo.cleanSlug, name);
+    }
+
+    return { name, tcgplayerId: m[1], setHint, lang: 'en' };
+  }
+
+  /** Extract card name from img alt text inside a TCGPlayer link element. */
+  function tcgImageAlt(el) {
+    const alt = el.querySelector('img[alt]')?.alt?.trim();
+    if (!alt || alt.length < 2) return null;
+    // TCGPlayer alt text often has format: "Card Name (1234) (Rainbow Foil) [Set Name]"
+    // Strip collector number in parens, finish info in parens, and set name in brackets
+    const cleaned = alt
+      .replace(/\s*\([\d★]+\)\s*/g, '')               // (1234), (2289★)
+      .replace(/\s*\((?:Rainbow )?(?:Foil|Etched|Nonfoil|Surge Foil|Confetti Foil|Galaxy Foil|Textured Foil|Gilded Foil|Step-and-Compleat Foil|Serialized|Halo Foil|Borderless)\)\s*/gi, '')
+      .replace(/\s*\[.*?\]\s*/g, '')                   // [Set Name]
+      .trim();
+    return cleaned.length >= 2 ? cleaned : null;
+  }
+
+  /**
+   * Parse TCGPlayer product URL slug.
+   * Returns cleanSlug (for set derivation) and nameFallback (last-resort card name).
+   */
+  function parseTcgPlayerSlug(href) {
+    const m = href.match(/\/product\/\d+\/([^?#]+)/);
+    if (!m) return null;
+    let slug = m[1];
+
+    // Strip game prefix
+    slug = slug.replace(/^magic-the-gathering-/, '').replace(/^magic-/, '');
+
+    // Strip trailing finish/variant info
+    slug = slug.replace(/-(?:rainbow-foil|surge-foil|confetti-foil|galaxy-foil|textured-foil|gilded-foil|halo-foil|step-and-compleat-foil|foil-etched|etched-foil|foil|etched|nonfoil|borderless)$/, '');
+    // Strip trailing collector number
+    slug = slug.replace(/-\d+$/, '');
+
+    // nameFallback: last-resort name guess (just use the whole slug as-is)
+    const nameFallback = slug.replace(/-/g, ' ').trim();
+
+    return {
+      cleanSlug: slug,
+      nameFallback: nameFallback.length >= 2 ? nameFallback : null
+    };
+  }
+
+  /**
+   * Derive a set hint by stripping the card name from the TCGPlayer slug.
+   * E.g. slug "art-series-strixhaven-lightning-bolt-art-card" + name "Lightning Bolt Art Card"
+   *   → card as slug: "lightning-bolt-art-card"
+   *   → strip from end: "art-series-strixhaven"
+   *   → set hint: "art series strixhaven"
+   */
+  function deriveSetHintFromSlug(cleanSlug, cardName) {
+    // Normalize card name to slug form
+    const nameSlug = cardName.toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+    if (!nameSlug || nameSlug.length < 2) return null;
+
+    // Find rightmost occurrence of card name in slug
+    const idx = cleanSlug.lastIndexOf(nameSlug);
+    if (idx <= 0) return null;  // Not found, or at start (no set prefix)
+
+    // Everything before it is the set slug
+    const setSlug = cleanSlug.substring(0, idx).replace(/-+$/, '');
+    if (setSlug.length < 2) return null;
+
+    return setSlug.replace(/-/g, ' ').trim();
   }
 
   function extractScryfall(el) {
     const href = el.href || '';
     const m = href.match(/\/card\/([a-z0-9]+)\/([^/?#]+)/);
     if (m) {
+      const collectorNumber = decodeURIComponent(m[2]);
       return {
-        name: el.dataset?.cardName || cardText(el) || decodeURIComponent(m[2]).replace(/-/g, ' '),
+        name: el.dataset?.cardName || cardText(el) || collectorNumber.replace(/-/g, ' '),
         setCode: m[1],
-        collectorNumber: m[2],
+        collectorNumber: collectorNumber,
         lang: 'en'
       };
     }
@@ -658,6 +742,19 @@
   // POPUP LOGIC
   // ═══════════════════════════════════════════
 
+  // Extract Cardmarket idProduct from product page (same-origin fetch, fast)
+  async function fetchCardmarketProductId(url) {
+    try {
+      const res = await fetch(url, { credentials: 'same-origin' });
+      if (!res.ok) return null;
+      const html = await res.text();
+      const m = html.match(/idProduct[=:]\s*['"]?(\d+)/i);
+      return m ? parseInt(m[1]) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   async function showPopup(info, e, key) {
     currentCard = key;
     const gen = ++requestGeneration;
@@ -670,6 +767,12 @@
       info.variant != null ? `[V${info.variant}]` : '');
 
     try {
+      // Start CM product ID fetch in parallel (don't await yet)
+      const cmIdPromise = info.productUrl
+        ? fetchCardmarketProductId(info.productUrl)
+        : Promise.resolve(null);
+
+      // Send normal lookup immediately
       const res = await chrome.runtime.sendMessage({
         type: 'FETCH_CARD_PRICE',
         cardName: info.name,
@@ -694,6 +797,28 @@
         popup.querySelector('.mtg-popup-error span').textContent = '❌ "' + info.name + '" not found';
         setState('error');
       }
+
+      // After showing initial result, refine with Cardmarket product ID if available
+      const cmProductId = await cmIdPromise;
+      if (requestGeneration !== gen || !cmProductId) return;
+
+      const refined = await chrome.runtime.sendMessage({
+        type: 'FETCH_CARD_PRICE',
+        cardName: info.name,
+        lang: info.lang || 'en',
+        cardmarketProductId: cmProductId
+      });
+
+      if (requestGeneration !== gen) return;
+      if (refined.success) {
+        // Only update if it's actually a different card
+        if (refined.data.collectorNumber !== res.data?.collectorNumber || 
+            refined.data.setCode !== res.data?.setCode) {
+          log('Refined with Cardmarket product ID:', cmProductId, 
+            `(${res.data?.setCode}#${res.data?.collectorNumber} → ${refined.data.setCode}#${refined.data.collectorNumber})`);
+          renderPrice(refined.data);
+        }
+      }
     } catch (e) {
       if (requestGeneration !== gen) return;
       popup.querySelector('.mtg-popup-error span').textContent = '❌ Extension error';
@@ -714,8 +839,12 @@
     if (data.imageSmall) { img.src = data.imageSmall; img.style.display = 'block'; }
     else img.style.display = 'none';
 
-    $('.mtg-popup-name').textContent = data.name;
-    $('.mtg-popup-set').textContent = data.set + ' (' + data.setCode + ')';
+    // Show card name with variant info if available (e.g. "(2289) (Rainbow Foil)")
+    const nameEl = $('.mtg-popup-name');
+    nameEl.textContent = data.name + (data.variantName ? ' ' + data.variantName : '');
+
+    const setLine = data.set + (data.setCode ? ' (' + data.setCode + ')' : '');
+    $('.mtg-popup-set').textContent = setLine;
     $('.mtg-popup-type').textContent = data.typeLine;
 
     const p = data.prices || {};

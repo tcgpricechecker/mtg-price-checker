@@ -222,6 +222,7 @@ const REQUEST_QUEUE = [];
 const RATE_MS = 100;
 let lastRequest = 0;
 let queueProcessing = false;
+let activeLookupGen = 0;
 
 // ─── IN-FLIGHT DEDUPLICATION ───
 const inFlight = new Map();
@@ -494,6 +495,53 @@ function matchGroup(groups, scryfallSetName) {
 }
 
 /**
+ * Like matchGroup, but returns ALL groups above the minimum score threshold.
+ * Used when a specific product ID must be found across potentially multiple groups.
+ */
+function matchAllGroups(groups, setName) {
+  if (!setName || !groups) return [];
+
+  const normalize = s => s.toLowerCase()
+    .replace(/[:\-–—''",\.!?()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const STOP_WORDS = new Set(['the', 'of', 'and', 'a', 'an', 'in', 'for', 'to', 'with']);
+  const getWords = s => normalize(s).split(' ').filter(w => w.length > 1 && !STOP_WORDS.has(w));
+
+  const target = normalize(setName);
+  const targetWords = getWords(setName);
+  if (targetWords.length === 0) return [];
+
+  const MIN_SCORE = 0.5;
+  const results = [];
+
+  for (const g of groups) {
+    const gn = normalize(g.name);
+    const groupWords = getWords(g.name);
+    if (groupWords.length === 0) continue;
+
+    let targetInGroup = 0;
+    for (const tw of targetWords) {
+      if (groupWords.some(gw => gw === tw || gw.includes(tw) || tw.includes(gw))) targetInGroup++;
+    }
+    let groupInTarget = 0;
+    for (const gw of groupWords) {
+      if (targetWords.some(tw => tw === gw || tw.includes(gw) || gw.includes(tw))) groupInTarget++;
+    }
+
+    const score = (targetInGroup / targetWords.length + groupInTarget / groupWords.length) / 2;
+    const substringBonus = (gn.includes(target) || target.includes(gn)) ? 0.1 : 0;
+    const finalScore = score + substringBonus;
+
+    if (finalScore >= MIN_SCORE) {
+      results.push({ groupId: g.groupId, score: finalScore, name: g.name });
+    }
+  }
+
+  return results.sort((a, b) => b.score - a.score);
+}
+
+/**
  * Fetch TCGCSV prices for a specific TCGPlayer productId.
  */
 async function fetchTcgcsvPrices(productId, setName, cardName = null) {
@@ -626,6 +674,112 @@ async function fetchTcgcsvPrices(productId, setName, cardName = null) {
   } catch (e) {
     return null;
   }
+}
+
+/**
+ * Search for a specific TCGPlayer product ID across multiple TCGCSV groups.
+ * Unlike fetchTcgcsvPrices, this NEVER falls back to name matching.
+ * Used when Scryfall doesn't know a TCG ID (e.g. Rainbow Foil variants).
+ *
+ * @param {number} productId - TCGPlayer product ID
+ * @param {string[]} setHints - Set names to try (e.g. ["Secret Lair Drop Series", "Secret Lair Drop"])
+ * @returns {object|null} Price data or null
+ */
+async function fetchTcgcsvPricesDirectByProductId(productId, setHints) {
+  productId = parseInt(productId);
+  if (!productId) return null;
+
+  // Helper to find product object in products array
+  const findProduct = (products) => products?.find(p => p.productId === productId) || null;
+
+  // Check all cached groups first
+  for (const [gid, cached] of TCGCSV_CACHE.entries()) {
+    if (Date.now() - cached.ts < TCGCSV_CACHE_TTL && cached.prices.has(productId)) {
+      const product = findProduct(cached.products);
+      return { prices: cached.prices.get(productId), product, groupName: null };
+    }
+  }
+
+  const groups = await getTcgcsvGroups();
+  if (!groups) return null;
+
+  // Collect candidate groups from all hints (deduplicated)
+  const triedGroups = new Set();
+
+  for (const hint of setHints) {
+    if (!hint) continue;
+    const candidates = matchAllGroups(groups, hint);
+
+    for (const { groupId, name: groupName } of candidates) {
+      if (triedGroups.has(groupId)) continue;
+      triedGroups.add(groupId);
+
+      // Check cache for this group
+      const cached = TCGCSV_CACHE.get(groupId);
+      if (cached && Date.now() - cached.ts < TCGCSV_CACHE_TTL) {
+        if (cached.prices.has(productId)) {
+          const product = findProduct(cached.products);
+          return { prices: cached.prices.get(productId), product, groupName };
+        }
+        continue;
+      }
+
+      // Fetch this group
+      try {
+        const [pricesRes, productsRes] = await Promise.all([
+          fetch(`https://tcgcsv.com/tcgplayer/${MTG_CATEGORY_ID}/${groupId}/prices`),
+          fetch(`https://tcgcsv.com/tcgplayer/${MTG_CATEGORY_ID}/${groupId}/products`)
+        ]);
+
+        if (!pricesRes.ok) continue;
+        const pricesData = await pricesRes.json();
+        if (!pricesData.success || !pricesData.results) continue;
+
+        let products = [];
+        if (productsRes.ok) {
+          const productsData = await productsRes.json();
+          if (productsData.success && productsData.results) products = productsData.results;
+        }
+
+        // Build price map
+        const priceMap = new Map();
+        for (const p of pricesData.results) {
+          const pid = p.productId;
+          if (!pid) continue;
+          const isFoil = (p.subTypeName || '').toLowerCase().includes('foil');
+          let entry = priceMap.get(pid);
+          if (!entry) {
+            entry = { low: null, mid: null, high: null, market: null,
+                      lowFoil: null, midFoil: null, highFoil: null, marketFoil: null };
+            priceMap.set(pid, entry);
+          }
+          if (isFoil) {
+            entry.lowFoil = p.lowPrice ?? null; entry.midFoil = p.midPrice ?? null;
+            entry.highFoil = p.highPrice ?? null; entry.marketFoil = p.marketPrice ?? null;
+          } else {
+            entry.low = p.lowPrice ?? null; entry.mid = p.midPrice ?? null;
+            entry.high = p.highPrice ?? null; entry.market = p.marketPrice ?? null;
+          }
+        }
+
+        // Cache this group
+        TCGCSV_CACHE.set(groupId, { ts: Date.now(), prices: priceMap, products });
+        tcgcsvCacheDirty = true;
+        if (TCGCSV_CACHE.size > TCGCSV_CACHE_MAX) {
+          TCGCSV_CACHE.delete(TCGCSV_CACHE.keys().next().value);
+        }
+
+        // Check for our product
+        if (priceMap.has(productId)) {
+          const product = findProduct(products);
+          return { prices: priceMap.get(productId), product, groupName };
+        }
+      } catch (e) {
+      }
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -816,6 +970,18 @@ function queuedFetch(url) {
   return promise;
 }
 
+// Flush all pending (not-yet-started) queue entries.
+// Called when a new user-initiated lookup starts to prevent stale requests from blocking the queue.
+function flushPendingQueue() {
+  let flushed = 0;
+  while (REQUEST_QUEUE.length > 0) {
+    const req = REQUEST_QUEUE.shift();
+    req.resolve(null);
+    flushed++;
+  }
+  if (flushed > 0) console.log(`[Queue] Flushed ${flushed} pending requests`);
+}
+
 async function processQueue() {
   if (queueProcessing) return;
   queueProcessing = true;
@@ -857,89 +1023,122 @@ async function processQueue() {
 // MAIN LOOKUP
 // ═══════════════════════════════════════════
 async function handleLookup(msg) {
-  const { cardName, lang, tcgplayerId, setHint, setCode, collectorNumber, scryfallId, variant } = msg;
+  const { cardName, lang, tcgplayerId, setHint, setCode, collectorNumber, scryfallId, variant, cardmarketProductId } = msg;
+  
+  // Refinement requests (cardmarketProductId only) should not flush the queue
+  const isRefinement = cardmarketProductId && !setHint && !setCode && !scryfallId && !tcgplayerId;
+  if (!isRefinement) {
+    ++activeLookupGen;
+    flushPendingQueue();
+  }
+  const gen = activeLookupGen;
 
   let result;
+  let overrideTcgPlayerId = null;
 
   if (scryfallId) {
     result = await lookupByScryfallId(scryfallId);
   } else if (tcgplayerId) {
     result = await lookupByTcgId(tcgplayerId);
+    // Fallback: Scryfall doesn't know all TCGPlayer IDs (e.g. Rainbow Foil variants).
+    // Find the card by name (for image/info), then override tcgplayerId for correct TCGCSV pricing.
+    if (!result.success && cardName && cardName !== 'Unknown') {
+      console.log(`[handleLookup] TCG ID ${tcgplayerId} not found at Scryfall, falling back to name search: "${cardName}"${setHint ? ` [hint: ${setHint}]` : ''}`);
+      result = await lookupByName(cardName, lang, setHint, variant, null);
+      if (result.success) {
+        overrideTcgPlayerId = parseInt(tcgplayerId);
+      }
+    }
   } else if (setCode && collectorNumber) {
     result = await lookupByCollector(setCode, collectorNumber);
   } else if (setCode && cardName) {
     result = await lookupByNameAndSet(cardName, setCode);
   } else {
-    result = await lookupByName(cardName, lang, setHint, variant);
+    result = await lookupByName(cardName, lang, setHint, variant, cardmarketProductId);
   }
 
   if (!result.success) return result;
 
+  // Bail out if a newer lookup has started (don't waste time on TCGCSV enrichment)
+  if (gen < activeLookupGen) return { success: false, error: 'stale' };
+
   const card = JSON.parse(JSON.stringify(result.data));
   card.links.ebay = buildEbayLink(card.name, card.set);
 
+  // Apply tcgplayerId override (from TCG ID fallback - card info from Scryfall, price ID from URL)
+  if (overrideTcgPlayerId) {
+    card.tcgplayerId = overrideTcgPlayerId;
+  }
+
   // TCGCSV Price Enrichment
-  if (card.tcgplayerId && card.set) {
+  let tcgPrices = null;
+
+  if (overrideTcgPlayerId) {
+    // Override path: Scryfall doesn't know this TCG ID.
+    // Get prices AND product info from TCGCSV directly.
     try {
-      const tcgPrices = await fetchTcgcsvPrices(card.tcgplayerId, card.set, card.name);
-      
-      if (tcgPrices) {
-        card.prices.low = tcgPrices.low;
-        card.prices.mid = tcgPrices.mid;
-        card.prices.high = tcgPrices.high;
-        card.prices.market = tcgPrices.market;
-        card.prices.lowFoil = tcgPrices.lowFoil;
-        card.prices.midFoil = tcgPrices.midFoil;
-        card.prices.highFoil = tcgPrices.highFoil;
-        card.prices.marketFoil = tcgPrices.marketFoil;
-        
-        // Check if we got any actual prices
-        const hasAnyPrice = tcgPrices.low != null || tcgPrices.mid != null || 
-          tcgPrices.market != null || tcgPrices.lowFoil != null || 
-          tcgPrices.midFoil != null || tcgPrices.marketFoil != null;
-        
-        if (hasAnyPrice) {
-          card.prices.source = 'tcgcsv';
-        } else {
-          // Product exists but no active listings
-          card.prices.source = 'tcgcsv-no-listings';
+      const tcgcsvResult = await fetchTcgcsvPricesDirectByProductId(
+        overrideTcgPlayerId,
+        [setHint, card.set].filter(Boolean)
+      );
+      if (tcgcsvResult) {
+        tcgPrices = tcgcsvResult.prices;
+        // Enhance card with TCGCSV product info (more accurate than Scryfall fallback)
+        const product = tcgcsvResult.product;
+        if (product) {
+          card.name = product.cleanName || card.name;
+          card.set = tcgcsvResult.groupName || card.set;
+          // Parse variant details from full product name
+          const variantSuffix = (product.name || '').replace(product.cleanName || '', '').trim();
+          if (variantSuffix) card.variantName = variantSuffix;
+          // Use TCGCSV product image if available
+          if (product.imageUrl) card.imageSmall = product.imageUrl;
+          // Extract collector number from product name if present, e.g. "(2289)"
+          const numMatch = (product.name || '').match(/\((\d+)\)/);
+          if (numMatch) card.collectorNumber = numMatch[1];
+          // Detect finish from product name
+          const nameLower = (product.name || '').toLowerCase();
+          if (nameLower.includes('rainbow foil')) card.finishes = ['foil'];
+          else if (nameLower.includes('foil etched') || nameLower.includes('etched foil')) card.finishes = ['etched'];
+          else if (nameLower.includes('foil') && !nameLower.includes('nonfoil')) card.finishes = ['foil'];
+          // Fix TCGPlayer link to point to the actual product page
+          card.links.tcgplayer = `https://www.tcgplayer.com/product/${overrideTcgPlayerId}`;
         }
       }
+    } catch (e) {}
+  } else if (card.tcgplayerId && card.set) {
+    try {
+      tcgPrices = await fetchTcgcsvPrices(card.tcgplayerId, card.set, card.name);
     } catch (e) {}
   } else if (card.set) {
-    // No tcgplayerId - try name-based lookup with variant info
     try {
-      const tcgPrices = await fetchTcgcsvPricesByName(
-        card.name, 
-        card.set, 
-        card.frameEffects || [], 
-        card.finishes || [],
+      tcgPrices = await fetchTcgcsvPricesByName(
+        card.name, card.set,
+        card.frameEffects || [], card.finishes || [],
         card.borderColor || 'black'
       );
-      
-      if (tcgPrices) {
-        card.prices.low = tcgPrices.low;
-        card.prices.mid = tcgPrices.mid;
-        card.prices.high = tcgPrices.high;
-        card.prices.market = tcgPrices.market;
-        card.prices.lowFoil = tcgPrices.lowFoil;
-        card.prices.midFoil = tcgPrices.midFoil;
-        card.prices.highFoil = tcgPrices.highFoil;
-        card.prices.marketFoil = tcgPrices.marketFoil;
-        
-        // Check if we got any actual prices
-        const hasAnyPrice = tcgPrices.low != null || tcgPrices.mid != null || 
-          tcgPrices.market != null || tcgPrices.lowFoil != null || 
-          tcgPrices.midFoil != null || tcgPrices.marketFoil != null;
-        
-        if (hasAnyPrice) {
-          card.prices.source = 'tcgcsv';
-        } else {
-          card.prices.source = 'tcgcsv-no-listings';
-        }
-      }
     } catch (e) {}
   }
+
+  if (tcgPrices) {
+    card.prices.low = tcgPrices.low;
+    card.prices.mid = tcgPrices.mid;
+    card.prices.high = tcgPrices.high;
+    card.prices.market = tcgPrices.market;
+    card.prices.lowFoil = tcgPrices.lowFoil;
+    card.prices.midFoil = tcgPrices.midFoil;
+    card.prices.highFoil = tcgPrices.highFoil;
+    card.prices.marketFoil = tcgPrices.marketFoil;
+
+    const hasAnyPrice = tcgPrices.low != null || tcgPrices.mid != null ||
+      tcgPrices.market != null || tcgPrices.lowFoil != null ||
+      tcgPrices.midFoil != null || tcgPrices.marketFoil != null;
+
+    card.prices.source = hasAnyPrice ? 'tcgcsv' : 'tcgcsv-no-listings';
+  }
+
+  // Rebuild eBay link with potentially enhanced card name/set
+  card.links.ebay = buildEbayLink(card.name, card.set);
 
   return { success: true, data: card };
 }
@@ -1009,8 +1208,28 @@ async function lookupByNameAndSet(name, setCode) {
   return result;
 }
 
-async function lookupByName(name, lang, setHint, variant) {
+async function lookupByName(name, lang, setHint, variant, cardmarketProductId) {
   const cleaned = simplify(name);
+  
+  // If we have a Cardmarket product ID, try direct lookup first (most precise)
+  if (cardmarketProductId) {
+    const key = `cm:${cardmarketProductId}`;
+    const cached = getCache(key);
+    if (cached) return cached;
+    
+    try {
+      const r = await fetch(`https://api.scryfall.com/cards/cardmarket/${cardmarketProductId}`);
+      if (r.ok) {
+        const cmCard = await r.json();
+        console.log(`[lookupByName] Exact match via Cardmarket product ID ${cardmarketProductId}: "${cmCard.set_name}" #${cmCard.collector_number}`);
+        const result = { success: true, data: formatCard(cmCard) };
+        setCache(key, result);
+        return result;
+      }
+    } catch (e) {}
+    console.log(`[lookupByName] Cardmarket product ID ${cardmarketProductId} not found, falling back to name lookup`);
+  }
+  
   const key = `name:${cleaned}:${setHint || ''}:${variant || ''}`;
   const cached = getCache(key);
   if (cached) return cached;
@@ -1039,11 +1258,30 @@ async function lookupByName(name, lang, setHint, variant) {
 async function findPrinting(cardName, setHint, variant) {
   try {
     const data = await queuedFetch(`https://api.scryfall.com/cards/search?q=!"${encodeURIComponent(cardName)}"&unique=prints&order=set`);
-    if (!data?.data?.length) return null;
+    if (!data?.data?.length) {
+      console.log('[findPrinting] No printings found for:', cardName);
+      return null;
+    }
 
     const printings = data.data;
+    console.log(`[findPrinting] Found ${printings.length} printings for "${cardName}", hint: "${setHint}"`);
     
-    const norm = s => s.replace(/[:\-–—''",\.!?()]/g, '').replace(/\s+/g, ' ').toLowerCase().trim();
+    // Basic normalization: remove punctuation, lowercase, collapse spaces
+    const norm = s => s.replace(/[:\-–—''",\.!?()®™]/g, '').replace(/\s+/g, ' ').toLowerCase().trim();
+    
+    // Advanced normalization: remove Cardmarket-specific noise
+    const normDeep = s => {
+      let r = norm(s);
+      // Remove common Cardmarket additions
+      r = r.replace(/\b(drop series|superdrop|winter|summer|fall|spring)\b/gi, '');
+      // Remove year patterns like "2024" or "2025" (but keep in player names)
+      r = r.replace(/\b(19|20)\d{2}\b/g, '');
+      // Remove "magic the gathering" prefix
+      r = r.replace(/^magic the gathering\s*/i, '');
+      // Collapse multiple spaces
+      r = r.replace(/\s+/g, ' ').trim();
+      return r;
+    };
     
     // Normalize Cardmarket hint: "Commander Bloomburrow" → "Bloomburrow Commander"
     let normalizedHint = setHint;
@@ -1057,47 +1295,107 @@ async function findPrinting(cardName, setHint, variant) {
     }
     
     const target = norm(normalizedHint);
+    const targetDeep = normDeep(normalizedHint);
     
-    // Tiered matching
-    const exactMatches = [];
-    const fuzzyMatches = [];
+    // Extract key identifying words (filter out common/noise words)
+    const NOISE_WORDS = new Set(['the', 'of', 'and', 'for', 'a', 'an', 'in', 'on', 'at', 'to', 'series', 'drop', 'superdrop', 'edition', 'set']);
+    const extractKeyWords = s => s.split(' ').filter(w => w.length > 2 && !NOISE_WORDS.has(w));
     
-    printings.forEach(c => {
+    const targetKeyWords = extractKeyWords(targetDeep);
+    console.log('[findPrinting] Target normalized:', targetDeep, '| Keywords:', targetKeyWords.join(', '));
+    
+    // Score-based matching
+    const scored = printings.map(c => {
       const n = norm(c.set_name);
+      const nDeep = normDeep(c.set_name);
+      const nKeyWords = extractKeyWords(nDeep);
       
-      // Exact match
-      if (n === target) {
-        exactMatches.push(c);
-        return;
+      let score = 0;
+      let matchType = 'none';
+      
+      // Exact match (highest priority)
+      if (n === target || nDeep === targetDeep) {
+        score = 1000;
+        matchType = 'exact';
       }
-      
       // Core match (strip extras/special/tokens)
-      const targetCore = target.replace(/\b(extras|special|tokens)\b/gi, '').replace(/\s+/g, ' ').trim();
-      const nCore = n.replace(/\b(extras|special|tokens)\b/gi, '').replace(/\s+/g, ' ').trim();
-      
-      if (nCore === targetCore) {
-        exactMatches.push(c);
-        return;
+      else {
+        const targetCore = target.replace(/\b(extras|special|tokens|promos)\b/gi, '').replace(/\s+/g, ' ').trim();
+        const nCore = n.replace(/\b(extras|special|tokens|promos)\b/gi, '').replace(/\s+/g, ' ').trim();
+        
+        if (nCore === targetCore) {
+          score = 900;
+          matchType = 'core-exact';
+        }
+        // Substring containment
+        else if (nDeep.length >= 4 && targetDeep.length >= 4) {
+          if (nDeep === targetDeep) {
+            score = 850;
+            matchType = 'deep-exact';
+          } else if (nDeep.includes(targetDeep) || targetDeep.includes(nDeep)) {
+            score = 500;
+            matchType = 'substring';
+          }
+        }
       }
       
-      // Substring match
-      if (nCore.length >= 4 && targetCore.length >= 4 &&
-          (nCore.includes(targetCore) || targetCore.includes(nCore))) {
-        fuzzyMatches.push(c);
-        return;
+      // Keyword overlap scoring (additive)
+      if (score < 500 && targetKeyWords.length > 0 && nKeyWords.length > 0) {
+        const overlap = targetKeyWords.filter(w => nKeyWords.includes(w)).length;
+        const overlapRatio = overlap / Math.max(targetKeyWords.length, nKeyWords.length);
+        
+        // Require at least 50% keyword overlap for a match
+        if (overlapRatio >= 0.5 && overlap >= 2) {
+          score = Math.max(score, 100 + Math.round(overlapRatio * 300));
+          matchType = matchType === 'none' ? `keyword-${overlap}/${targetKeyWords.length}` : matchType;
+        }
+        // Special case: if Scryfall set is short (like "Secret Lair") and ALL its keywords are in target
+        else if (nKeyWords.length <= 3 && nKeyWords.every(w => targetKeyWords.includes(w))) {
+          score = Math.max(score, 200);
+          matchType = matchType === 'none' ? 'scryfall-subset' : matchType;
+        }
       }
       
-      // Word overlap
-      const targetWords = targetCore.split(' ').filter(w => w.length > 2);
-      const nWords = nCore.split(' ').filter(w => w.length > 2);
-      const overlap = targetWords.filter(w => nWords.includes(w)).length;
-      const minRequired = Math.min(targetWords.length, nWords.length);
-      if (overlap >= minRequired && overlap >= 1 && minRequired >= 1) {
-        fuzzyMatches.push(c);
-      }
+      return { card: c, score, matchType, setName: c.set_name, nDeep };
     });
     
-    const setMatches = exactMatches.length > 0 ? exactMatches : fuzzyMatches;
+    // Filter to matches with score > 0
+    const matches = scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score);
+    
+    // Debug: log top matches
+    if (matches.length > 0) {
+      console.log('[findPrinting] Top matches:');
+      matches.slice(0, 5).forEach(m => {
+        console.log(`  [${m.score}] ${m.matchType}: "${m.setName}" (${m.card.set})`);
+      });
+    } else {
+      // Log available sets for debugging
+      const availableSets = [...new Set(printings.map(p => p.set_name))].slice(0, 10);
+      console.log('[findPrinting] NO MATCH! Available sets:', availableSets.join(' | '));
+    }
+    
+    // Get best matches (all with same top score)
+    const topScore = matches[0]?.score || 0;
+    let setMatches = matches.filter(m => m.score === topScore).map(m => m.card);
+
+    // Tie-breaker: When multiple cards score equally (e.g. all SLD printings),
+    // find keywords from setHint that are NOT in the matched set_name,
+    // then check each card's cardmarket URL for those distinguishing keywords.
+    if (setMatches.length > 1) {
+      const matchedSetName = setMatches[0].set_name || '';
+      const matchedKeyWords = extractKeyWords(normDeep(matchedSetName));
+      const extraKeyWords = targetKeyWords.filter(w => !matchedKeyWords.includes(w));
+      
+      if (extraKeyWords.length > 0) {
+        const cmMatches = setMatches.filter(c => {
+          const cmUrl = (c.purchase_uris?.cardmarket || '').toLowerCase();
+          return extraKeyWords.every(kw => cmUrl.includes(kw));
+        });
+        if (cmMatches.length > 0 && cmMatches.length < setMatches.length) {
+          setMatches = cmMatches;
+        }
+      }
+    }
 
     if (setMatches.length > 0) {
       const sortByNum = (a, b) => parseInt(a.collector_number) - parseInt(b.collector_number);
@@ -1108,7 +1406,7 @@ async function findPrinting(cardName, setHint, variant) {
       if (setMatches.length > 1) {
         const SPECIAL_FRAMES = ['extendedart', 'showcase', 'borderless', 'inverted', 'etched', 'textured'];
         
-        const annotated = setMatches.map(c => ({
+        const rawAnnotated = setMatches.map(c => ({
           card: c,
           num: parseInt(c.collector_number),
           numStr: c.collector_number,
@@ -1116,6 +1414,28 @@ async function findPrinting(cardName, setHint, variant) {
           isSpecial: (c.frame_effects || []).some(f => SPECIAL_FRAMES.includes(f)) ||
                      c.border_color === 'borderless'
         }));
+        
+        // Expand cards with mixed finishes (etched + nonfoil/foil) into separate entries.
+        // Cardmarket lists each finish as a separate variant (e.g. V2 = retro frame, V3 = retro frame etched),
+        // but Scryfall combines them into one entry with finishes: ['nonfoil', 'foil', 'etched'].
+        const annotated = [];
+        for (const entry of rawAnnotated) {
+          const finishes = entry.card.finishes || [];
+          const hasEtched = finishes.includes('etched');
+          const hasOtherFinishes = finishes.includes('nonfoil') || finishes.includes('foil');
+          
+          if (hasEtched && hasOtherFinishes) {
+            // Regular version (without etched)
+            const regularCard = Object.assign({}, entry.card, { finishes: finishes.filter(f => f !== 'etched') });
+            annotated.push(Object.assign({}, entry, { card: regularCard }));
+            // Etched version (etched only) - sorts directly after regular via num + 0.5
+            const etchedCard = Object.assign({}, entry.card, { finishes: ['etched'] });
+            annotated.push(Object.assign({}, entry, { card: etchedCard, num: entry.num + 0.5, isSpecial: true }));
+            console.log(`[findPrinting] Expanded "${entry.card.set_name}" #${entry.numStr} into regular + etched entries`);
+          } else {
+            annotated.push(entry);
+          }
+        }
         
         const baseCandidates = annotated
           .filter(c => !c.isPromo && !c.isSpecial)
@@ -1153,6 +1473,7 @@ async function findPrinting(cardName, setHint, variant) {
         }
       }
 
+      console.log('[findPrinting] Selected:', setMatches[0].set_name, `(${setMatches[0].set})`);
       return setMatches[0];
     }
 
@@ -1160,9 +1481,16 @@ async function findPrinting(cardName, setHint, variant) {
     const shortHint = setHint.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
     if (shortHint.length <= 6) {
       const codeMatch = printings.find(c => c.set === shortHint);
-      if (codeMatch) return codeMatch;
+      if (codeMatch) {
+        console.log('[findPrinting] Set code match:', codeMatch.set_name);
+        return codeMatch;
+      }
     }
-  } catch (e) {}
+    
+    console.log('[findPrinting] No match found for hint:', setHint);
+  } catch (e) {
+    console.error('[findPrinting] Error:', e);
+  }
   return null;
 }
 
