@@ -30,7 +30,8 @@ const PACKAGE_JSON = path.join(ROOT, 'package.json');
 // ─── UTILITIES ───
 
 function run(cmd, opts = {}) {
-  return execSync(cmd, { cwd: ROOT, encoding: 'utf8', ...opts }).trim();
+  const result = execSync(cmd, { cwd: ROOT, encoding: 'utf8', ...opts });
+  return result ? result.trim() : '';
 }
 
 function fail(msg) {
@@ -256,20 +257,26 @@ function buildAll() {
 }
 
 function packageAll() {
+  // Clean old packages first
+  const pkgDir = path.join(ROOT, 'packages');
+  if (fs.existsSync(pkgDir)) {
+    for (const f of fs.readdirSync(pkgDir)) {
+      if (f.endsWith('.zip')) fs.unlinkSync(path.join(pkgDir, f));
+    }
+  }
   run('node scripts/package.js', { stdio: 'inherit' });
 }
 
 // ─── GIT COMMIT & PUSH ───
 
 function gitCommitAndPush(version, branch) {
-  // Stage all release-relevant files
+  // Stage release-relevant tracked files
   run('git add package.json');
   for (const browser of BROWSERS) {
     run(`git add ${browser}/manifest.json`);
   }
-  run('git add shared/src/background.js');
-  run('git add dist/');
-  run('git add packages/');
+  run('git add shared/src/');
+  run('git add scripts/');
 
   // Also stage any other tracked changes
   try {
