@@ -1,30 +1,19 @@
 {
   "name": "mtg-price-checker",
-  "version": "1.5.5",
-  "description": "Multi-browser extension for Magic: The Gathering card price checking",
+  "version": "1.6.0",
+  "description": "MTG Card Price Checker - Browser Extension",
+  "private": true,
   "scripts": {
-    "build": "node build.js all",
-    "build:chrome": "node build.js chrome",
-    "build:firefox": "node build.js firefox",
-    "build:edge": "node build.js edge",
+    "build": "node build.js",
     "watch": "node watch.js",
-    "version:sync": "node scripts/sync-version.js",
     "package": "node scripts/package.js",
-    "release": "node scripts/release.js"
-  },
-  "keywords": [
-    "mtg",
-    "magic-the-gathering",
-    "price-checker",
-    "browser-extension"
-  ],
-  "author": "tcgpricechecker",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/tcgpricechecker/mtg-price-checker"
+    "release": "node scripts/release.js",
+    "sync-version": "node scripts/sync-version.js"
   },
   "devDependencies": {
-    "archiver": "^6.0.1"
+    "archiver": "^7.0.1"
+  },
+  "overrides": {
+    "minimatch": "^10.2.1"
   }
 }

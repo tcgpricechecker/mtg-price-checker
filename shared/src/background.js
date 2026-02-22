@@ -1,4 +1,4 @@
-// MTG Card Price Checker - Background Script v16
+// MTG Card Price Checker - Background Script
 // Service worker that handles all API calls to Scryfall, TCGCSV, and exchange rate lookups.
 //
 // APIs used:
@@ -20,16 +20,37 @@ const SENTRY_KEY = '688c325cc3bafb816f252807c6348269';
 const SENTRY_HOST = 'o4510896101720064.ingest.de.sentry.io';
 const EXTENSION_VERSION = chrome.runtime.getManifest().version;
 
+// Opt-in guard: Sentry only active if user explicitly enabled it
+async function isSentryEnabled() {
+  const data = await chrome.storage.local.get('errorTrackingEnabled');
+  return data.errorTrackingEnabled === true; // default: false (opt-in)
+}
+
+// Sanitize URLs before sending to Sentry — strip query params that may contain session tokens
+function sanitizeUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.origin + u.pathname;
+  } catch { return '[invalid url]'; }
+}
+
 // Rate limiting: max 3 same errors per day
 const SENTRY_RATE_LIMIT = 3;
 const SENTRY_RATE_WINDOW = 24 * 60 * 60 * 1000; // 24 hours
 const sentryRateMap = new Map(); // key -> { count, firstSeen }
+const SENTRY_RATE_MAP_MAX = 100; // Max unique error keys to track
 
 function checkSentryRateLimit(key) {
   const now = Date.now();
   const entry = sentryRateMap.get(key);
   
   if (!entry) {
+    // Evict expired entries when map gets large
+    if (sentryRateMap.size >= SENTRY_RATE_MAP_MAX) {
+      for (const [k, v] of sentryRateMap) {
+        if (now - v.firstSeen > SENTRY_RATE_WINDOW) sentryRateMap.delete(k);
+      }
+    }
     sentryRateMap.set(key, { count: 1, firstSeen: now });
     return true; // Allow
   }
@@ -52,6 +73,8 @@ function checkSentryRateLimit(key) {
 // Send error to Sentry
 async function sentryCaptureException(error, context = {}) {
   try {
+    if (!(await isSentryEnabled())) return;
+    
     const rateKey = `${error.name}:${error.message}`;
     if (!checkSentryRateLimit(rateKey)) {
       console.log('[Sentry] Rate limited:', rateKey);
@@ -72,6 +95,8 @@ async function sentryCaptureException(error, context = {}) {
 // Send message/warning to Sentry
 async function sentryCaptureMessage(message, level = 'info', context = {}) {
   try {
+    if (!(await isSentryEnabled())) return;
+    
     const rateKey = `msg:${message}`;
     if (!checkSentryRateLimit(rateKey)) {
       console.log('[Sentry] Rate limited:', rateKey);
@@ -197,7 +222,9 @@ self.addEventListener('unhandledrejection', (event) => {
   });
 });
 
-console.log(`[MTG Price Checker] v${EXTENSION_VERSION} - Error tracking enabled`);
+isSentryEnabled().then(enabled => {
+  console.log(`[MTG Price Checker] v${EXTENSION_VERSION} - Error tracking: ${enabled ? 'enabled (opt-in)' : 'disabled (default)'}`);
+});
 
 // ═══════════════════════════════════════════
 // END SENTRY
@@ -219,7 +246,7 @@ let tcgcsvCacheDirty = false;
 
 // ─── GLOBAL REQUEST QUEUE ───
 const REQUEST_QUEUE = [];
-const RATE_MS = 75;
+const RATE_MS = 100; // 10 req/s — Scryfall rate limit
 let lastRequest = 0;
 let queueProcessing = false;
 let activeLookupGen = 0;
@@ -268,13 +295,18 @@ const EXCHANGE_RATE_TTL = 24 * 60 * 60 * 1000;
       }
       if (loaded > 0) console.log('[MTG-PC] Loaded', loaded, 'TCGCSV cache entries');
     }
-  } catch (e) {}
-
+  } catch (e) {
+    console.warn('[MTG-PC] Failed to load persistent cache:', e.message);
+  }
   // Prefetch TCGCSV groups so first lookup doesn't pay the ~300ms penalty
   getTcgcsvGroups();
 })();
 
-setInterval(persistCache, CACHE_PERSIST_INTERVAL);
+// MV3: chrome.alarms survives service worker termination (setInterval does not)
+chrome.alarms.create('persistCache', { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'persistCache') persistCache();
+});
 
 async function persistCache() {
   try {
@@ -302,13 +334,18 @@ async function persistCache() {
     if (Object.keys(updates).length > 0) {
       await chrome.storage.local.set(updates);
     }
-  } catch (e) {}
+  } catch (e) {
+    console.warn('[MTG-PC] Failed to persist cache:', e.message);
+  }
 }
 
 // ═══════════════════════════════════════════
 // MESSAGE HANDLER
 // ═══════════════════════════════════════════
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Only accept messages from our own extension
+  if (sender.id !== chrome.runtime.id) return;
+
   if (msg.type === 'FETCH_CARD_PRICE') {
     handleLookup(msg).then(sendResponse);
     return true;
@@ -321,15 +358,66 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     getExchangeRate(msg.currency).then(sendResponse);
     return true;
   }
+  if (msg.type === 'FETCH_PRINTINGS') {
+    handleFetchPrintings(msg.cardName).then(sendResponse);
+    return true;
+  }
 });
+
+/**
+ * Fetch all printings of a card from Scryfall.
+ * Returns a compact list for the popup printing navigator.
+ */
+async function handleFetchPrintings(cardName) {
+  if (!cardName) return { success: false, data: [] };
+  try {
+    const data = await queuedFetch(
+      `https://api.scryfall.com/cards/search?q=!"${encodeURIComponent(cardName)}"&unique=prints&order=released&dir=desc`
+    );
+    if (!data?.data?.length) return { success: false, data: [] };
+
+    let printings = data.data;
+
+    // Paginate for cards with many printings (basic lands, etc.)
+    if (data.has_more && data.next_page) {
+      let nextUrl = data.next_page;
+      for (let page = 1; page < 5 && nextUrl; page++) {
+        const pageData = await queuedFetch(nextUrl);
+        if (!pageData?.data?.length) break;
+        printings = printings.concat(pageData.data);
+        nextUrl = pageData.has_more ? pageData.next_page : null;
+      }
+    }
+
+    // Filter out digital-only printings (MTGO, Arena) — no physical cards, no prices
+    printings = printings.filter(c => !c.digital);
+
+    // Return compact printing info
+    const results = printings.map(c => {
+      const imgs = c.image_uris || c.card_faces?.[0]?.image_uris || {};
+      return {
+        setCode: (c.set || '').toUpperCase(),
+        setName: c.set_name || '',
+        collectorNumber: c.collector_number || '',
+        rarity: c.rarity || '',
+        imageSmall: imgs.small || imgs.normal || '',
+      };
+    });
+
+    return { success: true, data: results };
+  } catch (e) {
+    return { success: false, data: [] };
+  }
+}
 
 async function handleSearch(query) {
   if (!query || query.length < 2) return { success: false, data: [] };
   try {
     const data = await queuedFetch(`https://api.scryfall.com/cards/autocomplete?q=${enc(query)}`);
     if (data) return { success: true, data: data.data || [] };
-  } catch (e) {}
-  return { success: false, data: [] };
+  } catch (e) {
+    console.warn('[handleSearch] Autocomplete error:', e.message);
+  }
 }
 
 // ═══════════════════════════════════════════
@@ -384,10 +472,14 @@ async function getTcgcsvGroups() {
         sentryCaptureMessage(`TCGCSV Groups API Error: ${res.status}`, 'warning', {
           extra: { status: res.status }
         });
+        tcgcsvGroupsPromise = null; // Allow retry on next call
         return null;
       }
       const data = await res.json();
-      if (!data.success || !data.results) return null;
+      if (!data.success || !data.results) {
+        tcgcsvGroupsPromise = null; // Allow retry on next call
+        return null;
+      }
       tcgcsvGroups = data.results;
       return tcgcsvGroups;
     } catch (e) {
@@ -409,13 +501,8 @@ async function getTcgcsvGroups() {
 function matchGroup(groups, scryfallSetName) {
   if (!scryfallSetName || !groups) return null;
 
-  const normalize = s => s.toLowerCase()
-    .replace(/[:\-–—''",\.!?()]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  const STOP_WORDS = new Set(['the', 'of', 'and', 'a', 'an', 'in', 'for', 'to', 'with']);
-  const getWords = s => normalize(s).split(' ').filter(w => w.length > 1 && !STOP_WORDS.has(w));
+  const target = normSetName(scryfallSetName);
+  const targetWords = getSetWords(scryfallSetName);
 
   // Scryfall → TCGPlayer name mappings
   const ALIASES = {
@@ -436,16 +523,13 @@ function matchGroup(groups, scryfallSetName) {
     'core set 2019': ['core set 2019', 'core 2019', 'm19'],
   };
 
-  const target = normalize(scryfallSetName);
-  const targetWords = getWords(scryfallSetName);
-
   // TIER 1: Alias lookup
   const aliasKey = target.replace(/\s+/g, ' ');
   if (ALIASES[aliasKey]) {
     for (const alias of ALIASES[aliasKey]) {
-      const aliasNorm = normalize(alias);
+      const aliasNorm = normSetName(alias);
       for (const g of groups) {
-        if (normalize(g.name) === aliasNorm) {
+        if (normSetName(g.name) === aliasNorm) {
           return g.groupId;
         }
       }
@@ -454,7 +538,7 @@ function matchGroup(groups, scryfallSetName) {
 
   // TIER 2: Exact normalized match
   for (const g of groups) {
-    if (normalize(g.name) === target) return g.groupId;
+    if (normSetName(g.name) === target) return g.groupId;
   }
 
   // TIER 3: Bidirectional word-overlap scoring
@@ -463,8 +547,8 @@ function matchGroup(groups, scryfallSetName) {
   const MIN_SCORE = 0.5;
 
   for (const g of groups) {
-    const gn = normalize(g.name);
-    const groupWords = getWords(g.name);
+    const gn = normSetName(g.name);
+    const groupWords = getSetWords(g.name);
     if (groupWords.length === 0) continue;
 
     let targetInGroup = 0;
@@ -504,23 +588,16 @@ function matchGroup(groups, scryfallSetName) {
 function matchAllGroups(groups, setName) {
   if (!setName || !groups) return [];
 
-  const normalize = s => s.toLowerCase()
-    .replace(/[:\-–—''",\.!?()]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  const STOP_WORDS = new Set(['the', 'of', 'and', 'a', 'an', 'in', 'for', 'to', 'with']);
-  const getWords = s => normalize(s).split(' ').filter(w => w.length > 1 && !STOP_WORDS.has(w));
-
-  const target = normalize(setName);
-  const targetWords = getWords(setName);
+  const target = normSetName(setName);
+  const targetWords = getSetWords(setName);
   if (targetWords.length === 0) return [];
 
   const MIN_SCORE = 0.5;
   const results = [];
 
   for (const g of groups) {
-    const gn = normalize(g.name);
-    const groupWords = getWords(g.name);
+    const gn = normSetName(g.name);
+    const groupWords = getSetWords(g.name);
     if (groupWords.length === 0) continue;
 
     let targetInGroup = 0;
@@ -613,32 +690,7 @@ async function fetchTcgcsvPrices(productId, setName, cardName = null) {
     }
 
     // Build price map
-    const priceMap = new Map();
-    for (const p of pricesData.results) {
-      const pid = p.productId;
-      if (!pid) continue;
-
-      const isFoil = (p.subTypeName || '').toLowerCase().includes('foil');
-      
-      let entry = priceMap.get(pid);
-      if (!entry) {
-        entry = { low: null, mid: null, high: null, market: null,
-                  lowFoil: null, midFoil: null, highFoil: null, marketFoil: null };
-        priceMap.set(pid, entry);
-      }
-
-      if (isFoil) {
-        entry.lowFoil = p.lowPrice ?? null;
-        entry.midFoil = p.midPrice ?? null;
-        entry.highFoil = p.highPrice ?? null;
-        entry.marketFoil = p.marketPrice ?? null;
-      } else {
-        entry.low = p.lowPrice ?? null;
-        entry.mid = p.midPrice ?? null;
-        entry.high = p.highPrice ?? null;
-        entry.market = p.marketPrice ?? null;
-      }
-    }
+    const priceMap = buildPriceMap(pricesData.results);
 
     // Cache
     TCGCSV_CACHE.set(groupId, { ts: Date.now(), prices: priceMap, products: products });
@@ -675,6 +727,7 @@ async function fetchTcgcsvPrices(productId, setName, cardName = null) {
     
     return null;
   } catch (e) {
+    console.warn('[fetchTcgcsvPrices] Error:', e.message);
     return null;
   }
 }
@@ -699,8 +752,6 @@ async function fetchTcgcsvPricesDirectByProductId(productId, setHints) {
   for (const [gid, cached] of TCGCSV_CACHE.entries()) {
     if (Date.now() - cached.ts < TCGCSV_CACHE_TTL && cached.prices.has(productId)) {
       const product = findProduct(cached.products);
-      console.log(`[TCGCSV-Direct] Product ${productId} found in cached group ${gid}` +
-        (product ? `: "${product.name}"` : ''));
       return { prices: cached.prices.get(productId), product, groupName: null };
     }
   }
@@ -714,8 +765,6 @@ async function fetchTcgcsvPricesDirectByProductId(productId, setHints) {
   for (const hint of setHints) {
     if (!hint) continue;
     const candidates = matchAllGroups(groups, hint);
-    console.log(`[TCGCSV-Direct] Hint "${hint}" matched ${candidates.length} groups:`,
-      candidates.map(c => `${c.name} (${c.score.toFixed(2)})`).join(', '));
 
     for (const { groupId, name: groupName } of candidates) {
       if (triedGroups.has(groupId)) continue;
@@ -726,8 +775,6 @@ async function fetchTcgcsvPricesDirectByProductId(productId, setHints) {
       if (cached && Date.now() - cached.ts < TCGCSV_CACHE_TTL) {
         if (cached.prices.has(productId)) {
           const product = findProduct(cached.products);
-          console.log(`[TCGCSV-Direct] Product ${productId} found in cached group "${groupName}"` +
-            (product ? `: "${product.name}"` : ''));
           return { prices: cached.prices.get(productId), product, groupName };
         }
         continue;
@@ -751,25 +798,7 @@ async function fetchTcgcsvPricesDirectByProductId(productId, setHints) {
         }
 
         // Build price map
-        const priceMap = new Map();
-        for (const p of pricesData.results) {
-          const pid = p.productId;
-          if (!pid) continue;
-          const isFoil = (p.subTypeName || '').toLowerCase().includes('foil');
-          let entry = priceMap.get(pid);
-          if (!entry) {
-            entry = { low: null, mid: null, high: null, market: null,
-                      lowFoil: null, midFoil: null, highFoil: null, marketFoil: null };
-            priceMap.set(pid, entry);
-          }
-          if (isFoil) {
-            entry.lowFoil = p.lowPrice ?? null; entry.midFoil = p.midPrice ?? null;
-            entry.highFoil = p.highPrice ?? null; entry.marketFoil = p.marketPrice ?? null;
-          } else {
-            entry.low = p.lowPrice ?? null; entry.mid = p.midPrice ?? null;
-            entry.high = p.highPrice ?? null; entry.market = p.marketPrice ?? null;
-          }
-        }
+        const priceMap = buildPriceMap(pricesData.results);
 
         // Cache this group
         TCGCSV_CACHE.set(groupId, { ts: Date.now(), prices: priceMap, products });
@@ -781,18 +810,13 @@ async function fetchTcgcsvPricesDirectByProductId(productId, setHints) {
         // Check for our product
         if (priceMap.has(productId)) {
           const product = findProduct(products);
-          console.log(`[TCGCSV-Direct] Product ${productId} found in group "${groupName}" (${priceMap.size} products)` +
-            (product ? `: "${product.name}"` : ''));
           return { prices: priceMap.get(productId), product, groupName };
         }
-        console.log(`[TCGCSV-Direct] Product ${productId} NOT in group "${groupName}" (${priceMap.size} products)`);
       } catch (e) {
-        console.log(`[TCGCSV-Direct] Error fetching group "${groupName}":`, e.message);
       }
     }
   }
 
-  console.log(`[TCGCSV-Direct] Product ${productId} not found in any matching group`);
   return null;
 }
 
@@ -802,31 +826,26 @@ async function fetchTcgcsvPricesDirectByProductId(productId, setHints) {
 function findProductByName(products, cardName) {
   if (!products || !cardName) return null;
   
-  const normalize = s => s.toLowerCase()
-    .replace(/[,.'":!?-]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  
-  const targetName = normalize(cardName);
+  const targetName = normCardName(cardName);
   
   // Exact match
   for (const p of products) {
-    if (normalize(p.name) === targetName) return p;
+    if (normCardName(p.name) === targetName) return p;
   }
   
   // Starts-with match
   for (const p of products) {
-    if (normalize(p.name).startsWith(targetName)) return p;
+    if (normCardName(p.name).startsWith(targetName)) return p;
   }
   
   // Reverse starts-with
   for (const p of products) {
-    if (targetName.startsWith(normalize(p.name))) return p;
+    if (targetName.startsWith(normCardName(p.name))) return p;
   }
   
   // Contains match
   for (const p of products) {
-    const pn = normalize(p.name);
+    const pn = normCardName(p.name);
     if (pn.includes(targetName) || targetName.includes(pn)) return p;
   }
   
@@ -840,12 +859,7 @@ function findProductByName(products, cardName) {
 function findProductByNameAndVariant(products, cardName, frameEffects = [], finishes = [], borderColor = 'black') {
   if (!products || !cardName) return null;
   
-  const normalize = s => s.toLowerCase()
-    .replace(/[,.'":!?-]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  
-  const baseName = normalize(cardName);
+  const baseName = normCardName(cardName);
   
   // Build variant keywords from Scryfall data
   const variantKeywords = [];
@@ -860,7 +874,7 @@ function findProductByNameAndVariant(products, cardName, frameEffects = [], fini
   
   // Search for products matching name + variant
   for (const p of products) {
-    const pn = normalize(p.name);
+    const pn = normCardName(p.name);
     
     // Must contain the card name
     if (!pn.includes(baseName) && !baseName.includes(pn.split('(')[0].trim())) continue;
@@ -907,38 +921,17 @@ async function fetchTcgcsvPricesByName(cardName, setName, frameEffects = [], fin
       if (!pricesData.success || !productsData.success) return null;
       
       // Build price map
-      const priceMap = new Map();
-      for (const p of pricesData.results) {
-        const pid = p.productId;
-        if (!pid) continue;
-        
-        const isFoil = (p.subTypeName || '').toLowerCase().includes('foil');
-        
-        let entry = priceMap.get(pid);
-        if (!entry) {
-          entry = { low: null, mid: null, high: null, market: null,
-                    lowFoil: null, midFoil: null, highFoil: null, marketFoil: null };
-          priceMap.set(pid, entry);
-        }
-        
-        if (isFoil) {
-          entry.lowFoil = p.lowPrice ?? null;
-          entry.midFoil = p.midPrice ?? null;
-          entry.highFoil = p.highPrice ?? null;
-          entry.marketFoil = p.marketPrice ?? null;
-        } else {
-          entry.low = p.lowPrice ?? null;
-          entry.mid = p.midPrice ?? null;
-          entry.high = p.highPrice ?? null;
-          entry.market = p.marketPrice ?? null;
-        }
-      }
+      const priceMap = buildPriceMap(pricesData.results);
       
       // Cache
       cached = { ts: Date.now(), prices: priceMap, products: productsData.results };
       TCGCSV_CACHE.set(groupId, cached);
       tcgcsvCacheDirty = true;
+      if (TCGCSV_CACHE.size > TCGCSV_CACHE_MAX) {
+        TCGCSV_CACHE.delete(TCGCSV_CACHE.keys().next().value);
+      }
     } catch (e) {
+      console.warn('[fetchTcgcsvPricesByName] Error:', e.message);
       return null;
     }
   }
@@ -1008,14 +1001,33 @@ async function processQueue() {
     lastRequest = Date.now();
 
     try {
-      const r = await fetch(req.url);
-      if (r.ok) {
-        req.resolve(await r.json());
+      let result = null;
+      let lastStatus = 0;
+      let lastStatusText = '';
+
+      for (let attempt = 0; attempt <= 2; attempt++) {
+        const r = await fetch(req.url);
+        if (r.ok) {
+          result = await r.json();
+          break;
+        }
+        lastStatus = r.status;
+        lastStatusText = r.statusText;
+        // Retry on 429 (rate limited) or 5xx (server error), but not on last attempt
+        if ((r.status === 429 || r.status >= 500) && attempt < 2) {
+          await new Promise(resolve => setTimeout(resolve, 200 * (attempt + 1)));
+          continue;
+        }
+        break; // Non-retryable error (4xx)
+      }
+
+      if (result) {
+        req.resolve(result);
       } else {
         // Log server errors (5xx) to Sentry - not 404s (those are normal)
-        if (r.status >= 500) {
-          sentryCaptureMessage(`API Error: ${r.status} from ${new URL(req.url).hostname}`, 'error', {
-            extra: { url: req.url, status: r.status, statusText: r.statusText }
+        if (lastStatus >= 500 || lastStatus === 429) {
+          sentryCaptureMessage(`API Error: ${lastStatus} from ${new URL(req.url).hostname}`, 'error', {
+            extra: { url: sanitizeUrl(req.url), status: lastStatus, statusText: lastStatusText }
           });
         }
         req.resolve(null);
@@ -1024,7 +1036,7 @@ async function processQueue() {
       // Network errors - log to Sentry
       sentryCaptureException(e, {
         tags: { type: 'network_error' },
-        extra: { url: req.url }
+        extra: { url: sanitizeUrl(req.url) }
       });
       req.resolve(null);
     }
@@ -1037,7 +1049,7 @@ async function processQueue() {
 // MAIN LOOKUP
 // ═══════════════════════════════════════════
 async function handleLookup(msg) {
-  const { cardName, lang, tcgplayerId, setHint, setCode, collectorNumber, scryfallId, variant, cardmarketProductId } = msg;
+  const { cardName, tcgplayerId, setHint, setCode, collectorNumber, scryfallId, variant, cardmarketProductId } = msg;
   
   // Refinement requests (cardmarketProductId only) should not flush the queue
   const isRefinement = cardmarketProductId && !setHint && !setCode && !scryfallId && !tcgplayerId;
@@ -1058,7 +1070,7 @@ async function handleLookup(msg) {
     // Find the card by name (for image/info), then override tcgplayerId for correct TCGCSV pricing.
     if (!result.success && cardName && cardName !== 'Unknown') {
       console.log(`[handleLookup] TCG ID ${tcgplayerId} not found at Scryfall, falling back to name search: "${cardName}"${setHint ? ` [hint: ${setHint}]` : ''}`);
-      result = await lookupByName(cardName, lang, setHint, variant, null);
+      result = await lookupByName(cardName, setHint, variant, null);
       if (result.success) {
         overrideTcgPlayerId = parseInt(tcgplayerId);
       }
@@ -1068,7 +1080,7 @@ async function handleLookup(msg) {
   } else if (setCode && cardName) {
     result = await lookupByNameAndSet(cardName, setCode);
   } else {
-    result = await lookupByName(cardName, lang, setHint, variant, cardmarketProductId);
+    result = await lookupByName(cardName, setHint, variant, cardmarketProductId);
   }
 
   if (!result.success) return result;
@@ -1081,7 +1093,6 @@ async function handleLookup(msg) {
 
   // Apply tcgplayerId override (from TCG ID fallback - card info from Scryfall, price ID from URL)
   if (overrideTcgPlayerId) {
-    console.log(`[handleLookup] Overriding tcgplayerId ${card.tcgplayerId} → ${overrideTcgPlayerId} for TCGCSV enrichment`);
     card.tcgplayerId = overrideTcgPlayerId;
   }
 
@@ -1101,10 +1112,6 @@ async function handleLookup(msg) {
         // Enhance card with TCGCSV product info (more accurate than Scryfall fallback)
         const product = tcgcsvResult.product;
         if (product) {
-          console.log('[handleLookup] Enhancing card with TCGCSV product:', JSON.stringify({
-            name: product.name, cleanName: product.cleanName, imageUrl: product.imageUrl,
-            url: product.url, number: product.number
-          }));
           card.name = product.cleanName || card.name;
           card.set = tcgcsvResult.groupName || card.set;
           // Parse variant details from full product name
@@ -1124,11 +1131,39 @@ async function handleLookup(msg) {
           card.links.tcgplayer = `https://www.tcgplayer.com/product/${overrideTcgPlayerId}`;
         }
       }
-    } catch (e) {}
+    } catch (e) {
+      console.warn('[handleLookup] TCGCSV override enrichment error:', e.message);
+    }
   } else if (card.tcgplayerId && card.set) {
     try {
-      tcgPrices = await fetchTcgcsvPrices(card.tcgplayerId, card.set, card.name);
-    } catch (e) {}
+      // Step 1: Try primary group by productId only (no name fallback).
+      // Passing null for cardName prevents fetchTcgcsvPrices from falling back to
+      // name matching, which could return prices for the wrong variant (e.g. regular
+      // instead of promo).
+      tcgPrices = await fetchTcgcsvPrices(card.tcgplayerId, card.set, null);
+
+      // Step 2: Multi-group search. Promo cards often live in a different TCGCSV group
+      // than matchGroup selects (e.g. Scryfall "Modern Horizons 2 Promos" vs TCGPlayer
+      // "Modern Horizons 2"). Search across all matching groups by productId.
+      if (!tcgPrices) {
+        const directResult = await fetchTcgcsvPricesDirectByProductId(
+          card.tcgplayerId,
+          [card.set]
+        );
+        if (directResult) {
+          tcgPrices = directResult.prices;
+        }
+      }
+
+      // Step 3: Name fallback as last resort. If the productId doesn't exist in any
+      // TCGCSV group, try matching by card name. This gives "close enough" prices
+      // (e.g. regular version prices for a promo) rather than nothing.
+      if (!tcgPrices) {
+        tcgPrices = await fetchTcgcsvPrices(card.tcgplayerId, card.set, card.name);
+      }
+    } catch (e) {
+      console.warn('[handleLookup] TCGCSV price enrichment error:', e.message);
+    }
   } else if (card.set) {
     try {
       tcgPrices = await fetchTcgcsvPricesByName(
@@ -1136,7 +1171,9 @@ async function handleLookup(msg) {
         card.frameEffects || [], card.finishes || [],
         card.borderColor || 'black'
       );
-    } catch (e) {}
+    } catch (e) {
+      console.warn('[handleLookup] TCGCSV name-based price lookup error:', e.message);
+    }
   }
 
   if (tcgPrices) {
@@ -1227,7 +1264,7 @@ async function lookupByNameAndSet(name, setCode) {
   return result;
 }
 
-async function lookupByName(name, lang, setHint, variant, cardmarketProductId) {
+async function lookupByName(name, setHint, variant, cardmarketProductId) {
   const cleaned = simplify(name);
   
   // If we have a Cardmarket product ID, try direct lookup first (most precise)
@@ -1245,8 +1282,9 @@ async function lookupByName(name, lang, setHint, variant, cardmarketProductId) {
         setCache(key, result);
         return result;
       }
-    } catch (e) {}
-    console.log(`[lookupByName] Cardmarket product ID ${cardmarketProductId} not found, falling back to name lookup`);
+    } catch (e) {
+      console.warn('[lookupByName] Cardmarket product ID lookup error:', e.message);
+    }
   }
   
   const key = `name:${cleaned}:${setHint || ''}:${variant || ''}`;
@@ -1429,20 +1467,13 @@ async function findPrinting(cardName, setHint, variant) {
           return extraKeyWords.every(kw => cmUrl.includes(kw));
         });
         if (cmMatches.length > 0 && cmMatches.length < setMatches.length) {
-          console.log(`[findPrinting] Extra-keyword tie-breaker: ${setMatches.length} → ${cmMatches.length} (extra keywords: ${extraKeyWords.join(', ')})`);
           setMatches = cmMatches;
-        } else {
-          // Debug: show what cardmarket URLs look like for first few matches
-          console.log(`[findPrinting] Tie-breaker missed (extra keywords: ${extraKeyWords.join(', ')}). Sample CM URLs:`);
-          setMatches.slice(0, 3).forEach(c => {
-            console.log(`  #${c.collector_number}: ${(c.purchase_uris?.cardmarket || 'none').substring(0, 120)}`);
-          });
         }
       }
     }
 
     if (setMatches.length > 0) {
-      const sortByNum = (a, b) => parseInt(a.collector_number) - parseInt(b.collector_number);
+      const sortByNum = (a, b) => safeParseCollectorNum(a.collector_number) - safeParseCollectorNum(b.collector_number);
       
       const isExtrasUrl = /\b(extras|special|tokens|promos)\b/i.test(setHint);
       const isPromosUrl = /\b(promos)\b/i.test(setHint);
@@ -1452,7 +1483,7 @@ async function findPrinting(cardName, setHint, variant) {
         
         const rawAnnotated = setMatches.map(c => ({
           card: c,
-          num: parseInt(c.collector_number),
+          num: safeParseCollectorNum(c.collector_number),
           numStr: c.collector_number,
           isPromo: c.promo === true || /[a-z]$/i.test(c.collector_number),
           isSpecial: (c.frame_effects || []).some(f => SPECIAL_FRAMES.includes(f)) ||
@@ -1542,6 +1573,80 @@ async function findPrinting(cardName, setHint, variant) {
 // HELPERS
 // ═══════════════════════════════════════════
 
+// ─── SHARED NORMALIZATION ───
+// Two distinct normalizers:
+//   normSetName  → for set name matching (punctuation → spaces, preserves word boundaries)
+//   normCardName → for card name matching (punctuation removed entirely)
+function normSetName(s) {
+  return s.toLowerCase()
+    .replace(/[:\-–—''",\.!?()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normCardName(s) {
+  return s.toLowerCase()
+    .replace(/[,.'":!?\-]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const SET_STOP_WORDS = new Set(['the', 'of', 'and', 'a', 'an', 'in', 'for', 'to', 'with']);
+
+function getSetWords(s) {
+  return normSetName(s).split(' ').filter(w => w.length > 1 && !SET_STOP_WORDS.has(w));
+}
+
+// ─── SHARED PRICE MAP BUILDER ───
+// Builds a Map<productId, {low,mid,high,market,lowFoil,...}> from TCGCSV price results.
+// Used by fetchTcgcsvPrices, fetchTcgcsvPricesDirectByProductId, fetchTcgcsvPricesByName.
+function buildPriceMap(priceResults) {
+  const priceMap = new Map();
+  for (const p of priceResults) {
+    const pid = p.productId;
+    if (!pid) continue;
+
+    const isFoil = (p.subTypeName || '').toLowerCase().includes('foil');
+
+    let entry = priceMap.get(pid);
+    if (!entry) {
+      entry = { low: null, mid: null, high: null, market: null,
+                lowFoil: null, midFoil: null, highFoil: null, marketFoil: null };
+      priceMap.set(pid, entry);
+    }
+
+    if (isFoil) {
+      entry.lowFoil = p.lowPrice ?? null;
+      entry.midFoil = p.midPrice ?? null;
+      entry.highFoil = p.highPrice ?? null;
+      entry.marketFoil = p.marketPrice ?? null;
+    } else {
+      entry.low = p.lowPrice ?? null;
+      entry.mid = p.midPrice ?? null;
+      entry.high = p.highPrice ?? null;
+      entry.market = p.marketPrice ?? null;
+    }
+  }
+  return priceMap;
+}
+
+// ─── URL VALIDATION ───
+// Only allow https:// URLs in links shown to users. Prevents javascript: injection
+// from compromised API responses.
+function safeUrl(url) {
+  if (!url || typeof url !== 'string') return '';
+  return url.startsWith('https://') || url.startsWith('http://') ? url : '';
+}
+
+// ─── SAFE COLLECTOR NUMBER PARSING ───
+// Collector numbers can be non-numeric ("12a", "GR8", "★"). parseInt returns NaN
+// for non-numeric prefixes, which breaks sort comparisons. Default to Infinity
+// so non-numeric entries sort to the end.
+function safeParseCollectorNum(cn) {
+  const n = parseInt(cn);
+  return Number.isNaN(n) ? Infinity : n;
+}
+
 function simplify(name) {
   return name
     .replace(/\s*\(.*?\)/g, '')
@@ -1601,6 +1706,13 @@ function formatCard(card) {
   const frameEffects = card.frame_effects || [];
   const borderColor = card.border_color || 'black';
 
+  // Card colors for frame theming (W, U, B, R, G)
+  let colors = card.colors || [];
+  // Double-faced cards: use front face colors
+  if (colors.length === 0 && faces.length > 0 && faces[0].colors) {
+    colors = faces[0].colors;
+  }
+
   return {
     name: card.name,
     set: card.set_name,
@@ -1609,6 +1721,7 @@ function formatCard(card) {
     rarity: card.rarity || '',
     typeLine: card.type_line || '',
     oracleText: oracleText,
+    colors: colors,
     imageSmall: imgs.small || imgs.normal || '',
     tcgplayerId: tcgplayerId,
     // Variant info for TCGCSV fallback
@@ -1627,9 +1740,9 @@ function formatCard(card) {
       source: 'scryfall'
     },
     links: {
-      scryfall: card.scryfall_uri || '',
-      cardmarket: card.purchase_uris?.cardmarket || '',
-      tcgplayer: card.purchase_uris?.tcgplayer || '',
+      scryfall: safeUrl(card.scryfall_uri),
+      cardmarket: safeUrl(card.purchase_uris?.cardmarket),
+      tcgplayer: safeUrl(card.purchase_uris?.tcgplayer),
       ebay: '',
     }
   };

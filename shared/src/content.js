@@ -1,12 +1,7 @@
-// MTG Card Price Checker - Content Script v19
+// MTG Card Price Checker - Content Script
 // Displays card prices from TCGCSV (TCGPlayer) when hovering over card links on MTG websites.
 // All prices are in USD from TCGPlayer, converted to user's local currency.
-//
-// v19 changes:
-//   - TCGCSV integration: Real TCGPlayer prices (Low/Mid/High) instead of Scryfall Trend
-//   - Popup shows Low/Mid/High/Foil for cards with TCGCSV data
-//   - Fallback to Scryfall Trend for cards without TCGCSV data
-//   - Source label shows "TCGPlayer" or "TCGPlayer USD" for non-USD users
+// Scryfall trend prices used as fallback when TCGCSV data is unavailable.
 
 (function () {
   'use strict';
@@ -30,10 +25,20 @@
 
   // ─── DRAG STATE ───
   let isDragging = false;
+  let isResizing = false;
   let dragOffsetX = 0, dragOffsetY = 0;
 
   // ─── SAVED POSITION ───
   let savedPos = null; // { x, y, w, h } in viewport pixels
+
+  // ─── ORACLE TEXT STATE ───
+  let oracleExpanded = false;
+
+  // ─── SHADOW DOM ROOT ───
+  let shadowRoot = null;
+
+  // ─── HOVER POPUP ENABLED ───
+  let hoverEnabled = true; // Default: enabled. Loaded from chrome.storage on init.
 
   // ─── CURRENCY DETECTION ───
   const LOCALE_TO_CUR = {
@@ -107,7 +112,7 @@
   // Each supported site defines:
   //   test(href): returns true if a link's href matches a card URL pattern
   //   selectors: CSS selectors for card elements (used if test alone isn't enough)
-  //   extract(el): extracts card info { name, lang, setHint, variant, ... } from an element
+  //   extract(el): extracts card info { name, setHint, variant, ... } from an element
   //   spa: if true, enables periodic rescan for late-rendering React/SPA content
   //   findHoverTarget(el): optional — given a matched element, return the element to
   //                        actually attach hover listeners to (e.g., a visible parent container)
@@ -131,14 +136,32 @@
             variant = parseInt(vMatch[1]);
             cardSlug = cardSlug.replace(/\s+V\s*\.?\s*\d+\s*$/i, '').trim();
           }
-          const langMatch = href.match(/cardmarket\.com\/(\w{2})\//);
-          const lang = langMatch ? langMatch[1] : 'en';
+          // Extract Cardmarket product ID from thumbnail image URL.
+          // Pattern: product-images.s3.cardmarket.com/1/SET/{ID}/{ID}.jpg
+          // Search: inside link → parent container → previous sibling
+          let cardmarketProductId = null;
+          const cmImgPattern = /product-images\.s3\.cardmarket\.com\/\d+\/\w+\/(\d+)\//;
+          const findCmImage = (root) => {
+            if (!root) return null;
+            const img = root.querySelector('img[src*="product-images"]');
+            return img ? img.src.match(cmImgPattern) : null;
+          };
+          let idMatch = findCmImage(el);
+          if (!idMatch) {
+            // Search parent container (table row, card tile, etc.)
+            idMatch = findCmImage(el.closest('tr, .row, .col, [class*="card"], [class*="product"], [class*="result"]'));
+          }
+          if (!idMatch && el.previousElementSibling) {
+            // Some layouts put the image in a sibling element before the link
+            idMatch = findCmImage(el.previousElementSibling);
+          }
+          if (idMatch) cardmarketProductId = parseInt(idMatch[1]);
           if (cardSlug.length >= 2) {
-            return { name: cardSlug, lang, setHint: setSlug, variant, productUrl: href };
+            return { name: cardSlug, setHint: setSlug, variant, productUrl: href, cardmarketProductId };
           }
         }
         const text = cardText(el);
-        if (text) return { name: text, lang: 'de' };
+        if (text) return { name: text };
         return null;
       }
     },
@@ -184,13 +207,13 @@
           const m = href.match(/\/(cards|commanders)\/([^/?#]+)/);
           if (m) {
             const name = decodeURIComponent(m[2]).replace(/-/g, ' ').trim();
-            if (name.length >= 2) return { name, lang: 'en' };
+            if (name.length >= 2) return { name };
           }
         }
         const text = cardText(el);
         if (!text) return null;
         if (/^(New|Top|High Synergy|Creatures|Instants|Sorceries|Artifacts|Enchantments|Planeswalkers|Lands|Mana Artifacts|View More|Budget|Expensive|Most Popular|Synergy|Commander|Theme|Tribe|Primer)$/i.test(text)) return null;
-        return { name: text, lang: 'en' };
+        return { name: text };
       }
     },
 
@@ -201,61 +224,12 @@
       extract: extractScryfall
     },
 
-    // ─── MTG FANDOM WIKI ───
-    'mtg.fandom.com': {
-      test: (href) => {
-        if (!/mtg\.fandom\.com\/wiki\/[A-Z]/.test(href)) return false;
-        if (/\/(Category:|Special:|Template:|File:|List_of_|Glossary|Rules|Comprehensive_Rules)/.test(href)) return false;
-        return true;
-      },
-      selectors: [
-        '.mw-parser-output a[href*="/wiki/"]'
-      ],
-      extract: (el) => {
-        const href = el.href || '';
-        const wikiMatch = href.match(/\/wiki\/([^#?]+)/);
-        if (wikiMatch) {
-          const slug = decodeURIComponent(wikiMatch[1]).replace(/_/g, ' ').trim();
-          if (slug.length < 2) return null;
-          if (/^(List of|Glossary|Rules|Category|Template|Magic:|Dungeons)/.test(slug)) return null;
-          if (slug.includes('/')) return null;
-          const text = cardText(el) || slug;
-          return { name: text, lang: 'en' };
-        }
-        return null;
-      }
-    },
-
-    // ─── TAPPEDOUT ───
-    'tappedout.net': {
-      test: (href) => /tappedout\.net\/mtg-card\//.test(href),
-      selectors: [
-        'a[data-name]',
-        'span[data-name]',
-        'a.card-link',
-        'a[href*="/mtg-card/"]'
-      ],
-      extract: (el) => {
-        if (el.dataset?.name) {
-          return { name: el.dataset.name, lang: 'en' };
-        }
-        const href = el.href || '';
-        const m = href.match(/\/mtg-card\/([^/?#]+)/);
-        if (m) {
-          const name = decodeURIComponent(m[1]).replace(/-/g, ' ').trim();
-          if (name.length >= 2) return { name, lang: 'en' };
-        }
-        const text = cardText(el);
-        return text ? { name: text, lang: 'en' } : null;
-      }
-    }
   };
 
   // ─── DOMAIN ALIASES ───
   SITES['www.scryfall.com'] = SITES['scryfall.com'];
   SITES['cardmarket.com'] = SITES['www.cardmarket.com'];
   SITES['www.edhrec.com'] = SITES['edhrec.com'];
-  SITES['www.tappedout.net'] = SITES['tappedout.net'];
 
   // ─── REDDIT ───
   const redditConfig = {
@@ -264,7 +238,7 @@
     extract: (el) => {
       const href = el.href || '';
       const imgMatch = href.match(/cards\.scryfall\.io\/[^/]+\/[^/]+\/[^/]+\/[^/]+\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/);
-      if (imgMatch) return { name: cardText(el) || 'Unknown', scryfallId: imgMatch[1], lang: 'en' };
+      if (imgMatch) return { name: cardText(el) || 'Unknown', scryfallId: imgMatch[1] };
       return extractScryfall(el);
     }
   };
@@ -296,7 +270,7 @@
       setHint = deriveSetHintFromSlug(slugInfo.cleanSlug, name);
     }
 
-    return { name, tcgplayerId: m[1], setHint, lang: 'en' };
+    return { name, tcgplayerId: m[1], setHint };
   }
 
   /** Extract card name from img alt text inside a TCGPlayer link element. */
@@ -372,12 +346,11 @@
       return {
         name: el.dataset?.cardName || cardText(el) || collectorNumber.replace(/-/g, ' '),
         setCode: m[1],
-        collectorNumber: collectorNumber,
-        lang: 'en'
+        collectorNumber: collectorNumber
       };
     }
     const name = el.dataset?.cardName || cardText(el);
-    return name ? { name, lang: 'en' } : null;
+    return name ? { name } : null;
   }
 
   /**
@@ -425,7 +398,24 @@
     if (!config) return;
     log('Init on', host);
 
-    detectCurrency();
+    // Load hover-popup setting (default: enabled)
+    try {
+      chrome.storage.local.get('hoverEnabled', (data) => {
+        if (data.hoverEnabled === false) {
+          hoverEnabled = false;
+          log('Hover popup disabled by user setting');
+        }
+      });
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area === 'local' && changes.hoverEnabled) {
+          hoverEnabled = changes.hoverEnabled.newValue !== false;
+          log('Hover popup', hoverEnabled ? 'enabled' : 'disabled');
+          if (!hoverEnabled) hidePopup();
+        }
+      });
+    } catch (e) {
+      // Extension context may not be available (e.g. during page unload)
+    }    detectCurrency();
     loadExchangeRate();
     createPopup();
 
@@ -525,7 +515,7 @@
                 n++;
               }
             }
-          } catch (e) {}
+          } catch (e) { /* skip individual element errors during scan */ }
         });
       }
 
@@ -581,7 +571,7 @@
       document.querySelectorAll('a[href]').forEach(el => {
         if (el.dataset.mtgAttached || seen.has(el)) return;
         seen.add(el);
-        try { if (config.test(el.href) && attach(el, config)) n++; } catch (e) {}
+        try { if (config.test(el.href) && attach(el, config)) n++; } catch (e) { /* skip individual element errors */ }
       });
     }
 
@@ -630,6 +620,7 @@
     let delegateKey = null;
 
     document.body.addEventListener('mouseover', (e) => {
+      if (!hoverEnabled) return;
       if (isDragging) return;
       if (popup && popup.contains(e.target)) return;
 
@@ -704,6 +695,7 @@
     hoverEl.classList.add('mtg-price-hover');
 
     hoverEl.addEventListener('mouseenter', (e) => {
+      if (!hoverEnabled) return;
       if (isDragging) return;
       clearTimeout(hideTimeout);
       const key = JSON.stringify(info);
@@ -761,28 +753,47 @@
     positionPopup(e);
     setState('loading');
 
+    // Late extraction: if cardmarketProductId was null at scan time (lazy-loaded images),
+    // try again now — by hover time the image is guaranteed to be visible and loaded.
+    if (!info.cardmarketProductId && activeTriggerEl) {
+      const cmImgPattern = /product-images\.s3\.cardmarket\.com\/\d+\/\w+\/(\d+)\//;
+      const img = activeTriggerEl.querySelector('img[src*="product-images"]');
+      if (img) {
+        const m = img.src.match(cmImgPattern);
+        if (m) {
+          info.cardmarketProductId = parseInt(m[1]);
+          // Update the cached key so future hovers don't re-lookup
+          key = JSON.stringify(info);
+          currentCard = key;
+        }
+      }
+    }
+
     log('Lookup:', info.name,
       info.setCode ? `[${info.setCode}${info.collectorNumber ? '/' + info.collectorNumber : ''}]` : '',
       info.setHint ? `[hint: ${info.setHint}]` : '',
-      info.variant != null ? `[V${info.variant}]` : '');
+      info.variant != null ? `[V${info.variant}]` : '',
+      info.cardmarketProductId ? `[cmId: ${info.cardmarketProductId}]` : '');
 
     try {
-      // Start CM product ID fetch in parallel (don't await yet)
-      const cmIdPromise = info.productUrl
+      // If we have a Cardmarket product ID from the thumbnail, use it directly.
+      // Otherwise fall back to scraping the product page (slow, causes 429s).
+      const hasCmId = !!info.cardmarketProductId;
+      const cmIdPromise = (!hasCmId && info.productUrl)
         ? fetchCardmarketProductId(info.productUrl)
         : Promise.resolve(null);
 
-      // Send normal lookup immediately
+      // Send lookup — with cardmarketProductId if available for direct match
       const res = await chrome.runtime.sendMessage({
         type: 'FETCH_CARD_PRICE',
         cardName: info.name,
-        lang: info.lang || 'en',
         tcgplayerId: info.tcgplayerId || null,
         setHint: info.setHint || null,
         setCode: info.setCode || null,
         collectorNumber: info.collectorNumber || null,
         scryfallId: info.scryfallId || null,
-        variant: info.variant != null ? info.variant : null
+        variant: info.variant != null ? info.variant : null,
+        cardmarketProductId: info.cardmarketProductId || null
       });
 
       if (requestGeneration !== gen) {
@@ -791,7 +802,7 @@
       }
 
       if (!res.success) {
-        popup.querySelector('.mtg-popup-error span').textContent = '❌ "' + info.name + '" not found';
+        shadowRoot.querySelector('.mtg-popup-error span').textContent = '❌ "' + info.name + '" not found';
         setState('error');
         return;
       }
@@ -799,14 +810,16 @@
       renderPrice(res.data);
       setState('content');
 
-      // After showing initial result, refine with Cardmarket product ID if available
+      // Refine with Cardmarket product ID only if we didn't already have one from thumbnail.
+      // When hasCmId is true, the initial lookup already used the exact product ID.
+      if (hasCmId) return;
+
       const cmProductId = await cmIdPromise;
       if (requestGeneration !== gen || !cmProductId) return;
 
       const refined = await chrome.runtime.sendMessage({
         type: 'FETCH_CARD_PRICE',
         cardName: info.name,
-        lang: info.lang || 'en',
         cardmarketProductId: cmProductId
       });
 
@@ -822,37 +835,50 @@
       }
     } catch (e) {
       if (requestGeneration !== gen) return;
-      popup.querySelector('.mtg-popup-error span').textContent = '❌ Extension error';
+      shadowRoot.querySelector('.mtg-popup-error span').textContent = '❌ Extension error';
       setState('error');
     }
   }
 
   function setState(s) {
-    popup.querySelector('.mtg-popup-loading').style.display = s === 'loading' ? 'flex' : 'none';
-    popup.querySelector('.mtg-popup-content').style.display = s === 'content' ? 'flex' : 'none';
-    popup.querySelector('.mtg-popup-error').style.display = s === 'error' ? 'flex' : 'none';
+    shadowRoot.querySelector('.mtg-popup-loading').style.display = s === 'loading' ? 'flex' : 'none';
+    shadowRoot.querySelector('.mtg-popup-content').style.display = s === 'content' ? 'flex' : 'none';
+    shadowRoot.querySelector('.mtg-popup-error').style.display = s === 'error' ? 'flex' : 'none';
+    popup.style.height = '';
     popup.classList.add('mtg-popup-visible');
   }
 
   function renderPrice(data) {
-    const $ = s => popup.querySelector(s);
+    const $ = s => shadowRoot.querySelector(s);
     const img = $('.mtg-popup-image');
     if (data.imageSmall) { img.src = data.imageSmall; img.style.display = 'block'; }
     else img.style.display = 'none';
 
     // Show card name with variant info if available (e.g. "(2289) (Rainbow Foil)")
     const nameEl = $('.mtg-popup-name');
-    nameEl.textContent = data.name + (data.variantName ? ' ' + data.variantName : '');
+    const displayName = data.name + (data.variantName ? ' ' + data.variantName : '');
 
-    const setLine = data.set + (data.setCode ? ' (' + data.setCode + ')' : '');
-    $('.mtg-popup-set').textContent = setLine;
-    $('.mtg-popup-type').textContent = data.typeLine;
-
+    // Detect foil status early (needed for card name styling)
     const p = data.prices || {};
     const hasTcgcsv = p.source === 'tcgcsv' && (
       p.low != null || p.mid != null || p.high != null ||
       p.lowFoil != null || p.midFoil != null || p.highFoil != null
     );
+    const hasNormalPrices = p.low != null || p.mid != null || p.market != null;
+    const hasFoilPrices = p.lowFoil != null || p.midFoil != null || p.marketFoil != null;
+    const isFoilOnly = hasTcgcsv && !hasNormalPrices && hasFoilPrices;
+
+    // Card name — rainbow shimmer for foil-only cards
+    if (isFoilOnly) {
+      nameEl.innerHTML = '<span class="mtg-foil-badge">' + displayName.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</span>';
+    } else {
+      nameEl.textContent = displayName;
+    }
+
+    const setLine = data.set + (data.setCode ? ' (' + data.setCode + ')' : '');
+    $('.mtg-popup-set').textContent = setLine;
+    $('.mtg-popup-type').textContent = data.typeLine;
+
     const sym = CUR_SYM[userCurrency] || userCurrency;
 
     // Helper to convert USD to user currency
@@ -883,17 +909,11 @@
     
     // Check for foil type from card data
     const isEtched = data.isEtched || (data.finishes && data.finishes.includes('etched') && !data.finishes.includes('nonfoil'));
-    const isFoilOnlyFinish = data.finishes && data.finishes.length === 1 && (data.finishes[0] === 'foil' || data.finishes[0] === 'etched');
     
     $('.mtg-section-title').textContent = sym + ' ' + userCurrency + ' (' + sourceLabel + ')';
 
     // ─── PRICE DISPLAY ───
     if (hasTcgcsv) {
-      // Check if this is a foil-only card (no normal prices, only foil prices)
-      const hasNormalPrices = p.low != null || p.mid != null || p.market != null;
-      const hasFoilPrices = p.lowFoil != null || p.midFoil != null || p.marketFoil != null;
-      const isFoilOnly = !hasNormalPrices && hasFoilPrices;
-
       let low, mid, market, foil;
 
       if (isFoilOnly) {
@@ -956,13 +976,17 @@
       }
     }
 
+    const oracleSection = $('.mtg-popup-oracle-section');
     const oracleEl = $('.mtg-popup-oracle');
-    if (oracleEl) {
+    if (oracleSection && oracleEl) {
       if (data.oracleText) {
         oracleEl.textContent = data.oracleText;
-        oracleEl.style.display = 'block';
+        oracleEl.style.display = oracleExpanded ? 'block' : 'none';
+        oracleSection.style.display = 'block';
+        const toggleEl = $('.mtg-popup-oracle-toggle');
+        if (toggleEl) toggleEl.textContent = oracleExpanded ? 'Card Text ▲' : 'Card Text ▼';
       } else {
-        oracleEl.style.display = 'none';
+        oracleSection.style.display = 'none';
       }
     }
   }
@@ -978,7 +1002,6 @@
       popup.style.left = Math.max(0, x) + 'px';
       popup.style.top = Math.max(0, y) + 'px';
       if (savedPos.w) popup.style.width = savedPos.w + 'px';
-      if (savedPos.h) popup.style.height = savedPos.h + 'px';
     } else {
       const pad = 15;
       let x = e.clientX + pad, y = e.clientY + pad;
@@ -992,8 +1015,8 @@
 
   function savePosition() {
     const rect = popup.getBoundingClientRect();
-    savedPos = { x: rect.left, y: rect.top, w: rect.width, h: rect.height };
-    try { chrome.storage.local.set({ mtgPopupPos: savedPos }); } catch (e) {}
+    savedPos = { x: rect.left, y: rect.top, w: rect.width };
+    try { chrome.storage.local.set({ mtgPopupPos: savedPos }); } catch (e) { /* storage may be unavailable */ }
   }
 
   function loadPosition() {
@@ -1004,7 +1027,7 @@
           log('Loaded saved position:', savedPos);
         }
       });
-    } catch (e) {}
+    } catch (e) { /* storage may be unavailable */ }
   }
 
   // ═══════════════════════════════════════════
@@ -1019,7 +1042,7 @@
     dragOffsetX = e.clientX - rect.left;
     dragOffsetY = e.clientY - rect.top;
     popup.style.cursor = 'grabbing';
-    popup.querySelector('.mtg-popup-drag-handle').style.cursor = 'grabbing';
+    shadowRoot.querySelector('.mtg-popup-drag-handle').style.cursor = 'grabbing';
     document.addEventListener('mousemove', onDrag);
     document.addEventListener('mouseup', stopDrag);
   }
@@ -1037,9 +1060,39 @@
   function stopDrag() {
     isDragging = false;
     popup.style.cursor = '';
-    popup.querySelector('.mtg-popup-drag-handle').style.cursor = 'grab';
+    shadowRoot.querySelector('.mtg-popup-drag-handle').style.cursor = 'grab';
     document.removeEventListener('mousemove', onDrag);
     document.removeEventListener('mouseup', stopDrag);
+    savePosition();
+  }
+
+  // ═══════════════════════════════════════════
+  // RESIZE (custom handle)
+  // ═══════════════════════════════════════════
+
+  let resizeStartX = 0;
+  let resizeStartW = 0;
+
+  function startResize(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    isResizing = true;
+    resizeStartX = e.clientX;
+    resizeStartW = popup.offsetWidth;
+    document.addEventListener('mousemove', onResize);
+    document.addEventListener('mouseup', stopResize);
+  }
+
+  function onResize(e) {
+    if (!isResizing) return;
+    const newW = Math.max(220, Math.min(500, resizeStartW + (e.clientX - resizeStartX)));
+    popup.style.width = newW + 'px';
+  }
+
+  function stopResize() {
+    isResizing = false;
+    document.removeEventListener('mousemove', onResize);
+    document.removeEventListener('mouseup', stopResize);
     savePosition();
   }
 
@@ -1054,13 +1107,49 @@
     resizeObserver = new ResizeObserver(() => {
       if (popup.classList.contains('mtg-popup-visible')) {
         savePosition();
-        const oracleEl = popup.querySelector('.mtg-popup-oracle');
+        const w = popup.offsetWidth;
+        // Scale factor: 1.0 at 280px, up to ~1.6 at 500px
+        const scale = w / 280;
+
+        // Image scales with width
+        const img = shadowRoot.querySelector('.mtg-popup-image');
+        if (img) img.style.maxWidth = Math.min(200, 80 * scale) + 'px';
+
+        // Card name font
+        const nameEl = shadowRoot.querySelector('.mtg-popup-name');
+        if (nameEl) nameEl.style.fontSize = Math.min(20, 14 * scale) + 'px';
+
+        // Set + type fonts
+        const setEl = shadowRoot.querySelector('.mtg-popup-set');
+        const typeEl = shadowRoot.querySelector('.mtg-popup-type');
+        const fontSize2 = Math.min(15, 11 * scale) + 'px';
+        if (setEl) setEl.style.fontSize = fontSize2;
+        if (typeEl) typeEl.style.fontSize = fontSize2;
+
+        // Price values
+        shadowRoot.querySelectorAll('.mtg-price-value').forEach(el => {
+          el.style.fontSize = Math.min(18, 13 * scale) + 'px';
+        });
+        shadowRoot.querySelectorAll('.mtg-price-label').forEach(el => {
+          el.style.fontSize = Math.min(15, 11 * scale) + 'px';
+        });
+
+        // Section title
+        const sectionTitle = shadowRoot.querySelector('.mtg-section-title');
+        if (sectionTitle) sectionTitle.style.fontSize = Math.min(16, 12 * scale) + 'px';
+
+        // Oracle text
+        const oracleEl = shadowRoot.querySelector('.mtg-popup-oracle');
         if (oracleEl) {
-          const w = popup.offsetWidth;
-          const fontSize = Math.min(16, Math.max(11, 11 + (w - 280) * 5 / 220));
-          oracleEl.style.fontSize = fontSize + 'px';
+          oracleEl.style.fontSize = Math.min(16, 11 * scale) + 'px';
           oracleEl.style.lineHeight = '1.5';
         }
+
+        // Link buttons
+        shadowRoot.querySelectorAll('.mtg-popup-links a').forEach(el => {
+          el.style.fontSize = Math.min(14, 11 * scale) + 'px';
+          el.style.padding = Math.min(8, 5 * scale) + 'px ' + Math.min(10, 6 * scale) + 'px';
+        });
       }
     });
     resizeObserver.observe(popup);
@@ -1093,10 +1182,441 @@
   // ═══════════════════════════════════════════
 
   function createPopup() {
+    // ─── INJECT @font-face INTO MAIN DOCUMENT ───
+    // Shadow DOM inherits @font-face from the host document.
+    // Font files must be declared here so they're available inside the shadow tree.
+    try {
+      const fontBoldUrl = chrome.runtime.getURL('fonts/CormorantGaramond-Bold.woff2');
+      const fontMediumUrl = chrome.runtime.getURL('fonts/CormorantGaramond-Medium.woff2');
+      const fontStyle = document.createElement('style');
+      fontStyle.id = 'mtg-pc-fonts';
+      fontStyle.textContent =
+        '@font-face { font-family: "Cormorant Garamond"; font-weight: 700; font-style: normal; font-display: swap; src: url("' + fontBoldUrl + '") format("woff2"); }' +
+        '@font-face { font-family: "Cormorant Garamond"; font-weight: 500; font-style: normal; font-display: swap; src: url("' + fontMediumUrl + '") format("woff2"); }';
+      if (!document.getElementById('mtg-pc-fonts')) {
+        document.head.appendChild(fontStyle);
+      }
+    } catch (e) {
+      // Extension context may be unavailable – font falls back gracefully
+    }
+
     popup = document.createElement('div');
     popup.id = 'mtg-price-popup';
-    popup.innerHTML =
-      '<div class="mtg-popup-inner">' +
+    shadowRoot = popup.attachShadow({ mode: 'open' });
+
+    // ─── ALL POPUP CSS ENCAPSULATED IN SHADOW DOM ───
+    const style = document.createElement('style');
+    style.textContent = `
+      /* ─── Host Element (positioning, visibility) ─── */
+      :host {
+        position: fixed;
+        z-index: 2147483647;
+        width: 280px;
+        min-width: 220px;
+        max-width: 500px;
+        min-height: 80px;
+        max-height: 90vh;
+        font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+        font-size: 13px;
+        color: #c2ccd2;
+        pointer-events: none;
+        opacity: 0;
+        transform: translateY(5px);
+        transition: opacity 0.15s ease, transform 0.15s ease;
+        resize: none;
+        overflow: hidden;
+      }
+
+      :host(.mtg-popup-visible) {
+        opacity: 1;
+        transform: translateY(0);
+        pointer-events: auto;
+      }
+
+      /* ─── Custom Resize Grip ─── */
+      .mtg-popup-resize-grip {
+        position: absolute;
+        bottom: 0;
+        right: 0;
+        width: 18px;
+        height: 18px;
+        cursor: nwse-resize;
+        z-index: 10;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 0 0 10px 0;
+      }
+
+      .mtg-popup-resize-grip::after {
+        content: '';
+        width: 8px;
+        height: 8px;
+        border-right: 2px solid #3e5858;
+        border-bottom: 2px solid #3e5858;
+        margin-top: -2px;
+        margin-left: -2px;
+      }
+
+      .mtg-popup-resize-grip:hover::after {
+        border-color: #649090;
+      }
+
+      /* ─── Inner Container ─── */
+      .mtg-popup-inner {
+        position: relative;
+        background: #161d21;
+        border: 1px solid #24383c;
+        border-radius: 10px;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+        font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+        color: #c2ccd2;
+        line-height: 1.4;
+        text-align: left;
+        min-width: 220px;
+        max-width: 500px;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+
+      /* ─── Drag Handle ─── */
+      .mtg-popup-drag-handle {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 3px 0;
+        cursor: grab;
+        background: #1c282c;
+        border-bottom: 1px solid #24383c;
+        border-radius: 10px 10px 0 0;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+
+      .mtg-popup-drag-handle:hover {
+        background: #222e32;
+      }
+
+      .mtg-popup-drag-handle:active {
+        cursor: grabbing;
+      }
+
+      .mtg-drag-dots {
+        font-size: 12px;
+        color: #4a6464;
+        letter-spacing: 2px;
+      }
+
+      /* ─── Loading & Error ─── */
+      .mtg-popup-loading,
+      .mtg-popup-error {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 20px;
+        font-size: 12px;
+        color: #3e5858;
+      }
+
+      .mtg-popup-error span { color: #e06050; }
+
+      .mtg-spinner {
+        width: 16px; height: 16px;
+        border: 2px solid #24383c;
+        border-top: 2px solid #5a9ad0;
+        border-radius: 50%;
+        animation: mtg-spin 0.8s linear infinite;
+      }
+      @keyframes mtg-spin { to { transform: rotate(360deg); } }
+
+      /* ─── Content Wrapper ─── */
+      .mtg-popup-content {
+        display: flex;
+        flex-direction: column;
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+      }
+
+      /* ─── Header ─── */
+      .mtg-popup-header {
+        display: flex;
+        flex-direction: row;
+        gap: 10px;
+        padding: 12px;
+        border-bottom: 1px solid #24383c;
+        flex-shrink: 0;
+      }
+
+      .mtg-popup-image {
+        width: 25%;
+        min-width: 50px;
+        max-width: 120px;
+        height: auto;
+        border-radius: 4px;
+        flex-shrink: 0;
+      }
+
+      .mtg-popup-info {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+
+      .mtg-popup-name {
+        font-family: 'Cormorant Garamond', Georgia, 'Palatino Linotype', serif;
+        font-weight: 700;
+        font-size: 14px;
+        color: #e8d5a3;
+        line-height: 1.2;
+      }
+
+      .mtg-popup-set {
+        font-family: 'Cormorant Garamond', Georgia, 'Palatino Linotype', serif;
+        font-weight: 500;
+        font-size: 11px;
+        color: #5a9ad0;
+      }
+
+      .mtg-popup-type {
+        font-family: 'Cormorant Garamond', Georgia, 'Palatino Linotype', serif;
+        font-weight: 500;
+        font-size: 11px;
+        color: #90acb0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* ─── Prices ─── */
+      .mtg-popup-prices {
+        padding: 8px 12px 6px;
+        flex-shrink: 0;
+      }
+
+      .mtg-section-title {
+        font-family: 'Cormorant Garamond', Georgia, 'Palatino Linotype', serif;
+        font-weight: 500;
+        font-size: 12px;
+        color: #649090;
+        padding: 4px 0 2px;
+        margin-bottom: 2px;
+        border-bottom: 1px solid #24383c;
+      }
+
+      .mtg-price-row {
+        justify-content: space-between;
+        align-items: center;
+        padding: 3px 4px;
+        border-radius: 4px;
+        flex-direction: row;
+      }
+
+      .mtg-row-low,
+      .mtg-row-mid,
+      .mtg-row-market,
+      .mtg-row-foil {
+        display: flex;
+      }
+
+      .mtg-price-row:hover {
+        background: rgba(200, 200, 210, 0.04);
+      }
+
+      .mtg-price-label {
+        font-size: 11px;
+        color: #587c82;
+      }
+
+      .mtg-price-value {
+        font-weight: 600;
+        font-size: 13px;
+        font-variant-numeric: tabular-nums;
+        color: #7ab648;
+      }
+
+      .mtg-price-value.mtg-price-medium { color: #d0b050; }
+      .mtg-price-value.mtg-price-high { color: #e06050; }
+
+      /* ─── Oracle Text ─── */
+      .mtg-popup-oracle-section {
+        border-top: 1px solid #24383c;
+        flex-shrink: 0;
+      }
+
+      .mtg-popup-oracle-toggle {
+        font-size: 12px;
+        color: #90b0b0;
+        padding: 6px 12px;
+        cursor: pointer;
+        text-align: center;
+        user-select: none;
+        transition: color 0.15s;
+      }
+
+      .mtg-popup-oracle-toggle:hover {
+        color: #c2ccd2;
+      }
+
+      .mtg-popup-oracle {
+        padding: 0 12px 8px;
+        font-size: 11px;
+        line-height: 1.4;
+        color: #90acb0;
+        white-space: pre-wrap;
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+      }
+
+      /* ─── Links ─── */
+      .mtg-popup-links {
+        display: flex;
+        flex-wrap: wrap;
+        flex-direction: row;
+        gap: 5px;
+        padding: 8px 12px 10px;
+        border-top: 1px solid #24383c;
+        flex-shrink: 0;
+      }
+
+      .mtg-popup-links a {
+        flex: 1 1 calc(50% - 4px);
+        min-width: 0;
+        text-align: center;
+        padding: 5px 6px;
+        font-size: 11px;
+        font-weight: 600;
+        background: transparent;
+        border-radius: 4px;
+        text-decoration: none;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 4px;
+        box-sizing: border-box;
+        margin: 0;
+        line-height: normal;
+        transition: all 0.15s ease;
+        letter-spacing: 0.2px;
+      }
+
+      .mtg-popup-links a svg {
+        width: 14px;
+        height: 14px;
+        flex-shrink: 0;
+      }
+
+      /* Scryfall — Blue */
+      .mtg-popup-links a.mtg-link-scryfall {
+        color: #e0eef8;
+        background: #1e5a8a;
+        border: 1px solid #2a6a9e;
+      }
+      .mtg-popup-links a.mtg-link-scryfall:hover {
+        background: #246ca0;
+        color: #ffffff;
+      }
+
+      /* Cardmarket — White Mana */
+      .mtg-popup-links a.mtg-link-cardmarket {
+        color: #3a3530;
+        background: #e8e0d0;
+        border: 1px solid #d0c8b8;
+      }
+      .mtg-popup-links a.mtg-link-cardmarket:hover {
+        background: #f0e8d8;
+        color: #2a2520;
+      }
+
+      /* TCGPlayer — Red Mana */
+      .mtg-popup-links a.mtg-link-tcgplayer {
+        color: #ffffff;
+        background: #8a3828;
+        border: 1px solid #a04030;
+      }
+      .mtg-popup-links a.mtg-link-tcgplayer:hover {
+        background: #a04030;
+        color: #ffffff;
+      }
+
+      /* eBay — Black Mana */
+      .mtg-popup-links a.mtg-link-ebay {
+        color: #a8a0b0;
+        background: #141018;
+        border: 1px solid #241e2a;
+      }
+      .mtg-popup-links a.mtg-link-ebay:hover {
+        background: #1e1824;
+        color: #c8c0d0;
+      }
+
+      /* ─── Footer ─── */
+      .mtg-popup-footer {
+        padding: 6px 12px 8px;
+        text-align: center;
+        border-top: 1px solid #24383c;
+        flex-shrink: 0;
+      }
+
+      .mtg-popup-footer a {
+        font-size: 11px;
+        color: #d0f0c0;
+        text-decoration: none;
+        transition: all 0.15s;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 3px;
+        padding: 6px 12px;
+        background: #1a3c18;
+        border: 1px solid #2a5426;
+        border-radius: 4px;
+      }
+
+      .mtg-popup-footer a:hover {
+        color: #e8ffe0;
+        background: #244a20;
+        border-color: #2a5426;
+      }
+
+      /* ─── Foil Badge with Rainbow Effect ─── */
+      .mtg-foil-badge {
+        display: inline-block;
+        background: linear-gradient(90deg, #ff6b6b, #feca57, #48dbfb, #ff9ff3, #54a0ff, #5f27cd, #ff6b6b);
+        background-size: 200% 100%;
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        animation: mtg-foil-shimmer 3s linear infinite;
+        font-weight: 600;
+        color: transparent;
+      }
+
+      @keyframes mtg-foil-shimmer {
+        0% { background-position: 0% 50%; }
+        100% { background-position: 200% 50%; }
+      }
+
+      /* ─── Scrollbar ─── */
+      ::-webkit-scrollbar { width: 4px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: #2e4248; border-radius: 2px; }
+    `;
+
+    // ─── POPUP HTML ───
+    const container = document.createElement('div');
+    container.className = 'mtg-popup-inner';
+    container.innerHTML =
         '<div class="mtg-popup-drag-handle">' +
           '<span class="mtg-drag-dots">☰</span>' +
         '</div>' +
@@ -1106,8 +1626,8 @@
             '<img class="mtg-popup-image" src="" alt="" />' +
             '<div class="mtg-popup-info">' +
               '<div class="mtg-popup-name"></div>' +
-              '<div class="mtg-popup-set"></div>' +
               '<div class="mtg-popup-type"></div>' +
+              '<div class="mtg-popup-set"></div>' +
             '</div>' +
           '</div>' +
           '<div class="mtg-popup-prices">' +
@@ -1117,22 +1637,38 @@
             '<div class="mtg-price-row mtg-row-market"><span class="mtg-price-label">Sold</span><span class="mtg-price-value" data-price="market"></span></div>' +
             '<div class="mtg-price-row mtg-row-foil"><span class="mtg-price-label"><span class="mtg-foil-badge">Foil</span></span><span class="mtg-price-value" data-price="foil"></span></div>' +
           '</div>' +
-          '<div class="mtg-popup-oracle" style="display:none;"></div>' +
+          '<div class="mtg-popup-oracle-section" style="display:none;">' +
+            '<div class="mtg-popup-oracle-toggle">Card Text ▼</div>' +
+            '<div class="mtg-popup-oracle"></div>' +
+          '</div>' +
           '<div class="mtg-popup-links">' +
-            '<a class="mtg-link-scryfall" href="#" target="_blank" rel="noopener">Scryfall</a>' +
-            '<a class="mtg-link-cardmarket" href="#" target="_blank" rel="noopener">Cardmarket</a>' +
-            '<a class="mtg-link-tcgplayer" href="#" target="_blank" rel="noopener">TCGPlayer</a>' +
-            '<a class="mtg-link-ebay" href="#" target="_blank" rel="noopener">🔨 eBay</a>' +
+            '<a class="mtg-link-scryfall" href="#" target="_blank" rel="noopener"><svg viewBox="0 0 12 12" fill="currentColor"><path d="M6 1 C6 1 2.5 5.5 2.5 7.5 C2.5 9.5 4 11 6 11 C8 11 9.5 9.5 9.5 7.5 C9.5 5.5 6 1 6 1Z"/></svg> Scryfall</a>' +
+            '<a class="mtg-link-cardmarket" href="#" target="_blank" rel="noopener"><svg viewBox="0 0 12 12" fill="currentColor"><path d="M6 0.5L7 4.2L10.5 2.5L8 5.5L11.5 6L8 6.5L10.5 9.5L7 7.8L6 11.5L5 7.8L1.5 9.5L4 6.5L0.5 6L4 5.5L1.5 2.5L5 4.2Z"/></svg> Cardmarket</a>' +
+            '<a class="mtg-link-tcgplayer" href="#" target="_blank" rel="noopener"><svg viewBox="0 0 12 12" fill="currentColor"><path d="M6 1C6 1 3.5 3.5 4.5 6C3.5 5 2.5 6 3 8C3.5 10 5 11 6 11C7 11 8.5 10 9 8C9.5 6 8.5 5 7.5 6C8.5 3.5 6 1 6 1Z"/></svg> TCGPlayer</a>' +
+            '<a class="mtg-link-ebay" href="#" target="_blank" rel="noopener"><svg viewBox="0 0 12 12" fill="currentColor"><path d="M6 1C3.5 1 2 2.8 2 5C2 6.5 2.8 7.8 4 8.3L4 10.5L5 9.5L6 10.5L7 9.5L8 10.5L8 8.3C9.2 7.8 10 6.5 10 5C10 2.8 8.5 1 6 1ZM4.5 5.5C4.5 4.9 5 4.5 5 4.5C5 4.5 4 5 4 5.8C3.8 5.2 4.2 4.5 4.8 4.2C4.3 4.8 4.5 5.5 4.5 5.5ZM4 6C3.6 6 3.3 5.6 3.3 5.2C3.3 4.8 3.6 4.4 4 4.4C4.4 4.4 4.7 4.8 4.7 5.2C4.7 5.6 4.4 6 4 6ZM8 6C7.6 6 7.3 5.6 7.3 5.2C7.3 4.8 7.6 4.4 8 4.4C8.4 4.4 8.7 4.8 8.7 5.2C8.7 5.6 8.4 6 8 6Z"/></svg> eBay</a>' +
           '</div>' +
           '<div class="mtg-popup-footer">' +
-            '<a href="https://ko-fi.com/tcgpricechecker" target="_blank" rel="noopener">☕ Support this project</a>' +
+            '<a href="https://ko-fi.com/tcgpricechecker" target="_blank" rel="noopener"><svg viewBox="0 0 12 12" fill="currentColor" style="width:12px;height:12px;vertical-align:-1px;margin-right:2px;"><path d="M6 1C4 3 2 5 3.5 7L5.2 7L5.2 11L6.8 11L6.8 7L8.5 7C10 5 8 3 6 1Z"/></svg>Support this project</a>' +
           '</div>' +
         '</div>' +
         '<div class="mtg-popup-error" style="display:none;"><span></span></div>' +
-      '</div>';
+        '<div class="mtg-popup-resize-grip"></div>';
+
+    shadowRoot.appendChild(style);
+    shadowRoot.appendChild(container);
     document.body.appendChild(popup);
 
-    popup.querySelector('.mtg-popup-drag-handle').addEventListener('mousedown', startDrag);
+    shadowRoot.querySelector('.mtg-popup-drag-handle').addEventListener('mousedown', startDrag);
+    shadowRoot.querySelector('.mtg-popup-resize-grip').addEventListener('mousedown', startResize);
+
+    // Oracle text toggle (collapsible)
+    shadowRoot.querySelector('.mtg-popup-oracle-toggle').addEventListener('click', () => {
+      const oracleEl = shadowRoot.querySelector('.mtg-popup-oracle');
+      const toggleEl = shadowRoot.querySelector('.mtg-popup-oracle-toggle');
+      oracleExpanded = !oracleExpanded;
+      oracleEl.style.display = oracleExpanded ? 'block' : 'none';
+      toggleEl.textContent = oracleExpanded ? 'Card Text ▲' : 'Card Text ▼';
+    });
 
     popup.addEventListener('mouseenter', () => {
       clearTimeout(hideTimeout);
@@ -1140,7 +1676,7 @@
       popupTouched = true;
     });
     popup.addEventListener('mouseleave', () => {
-      if (!isDragging) scheduleHide();
+      if (!isDragging && !isResizing) scheduleHide();
     });
 
     watchResize();

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MTG Card Price Checker",
-  "version": "1.5.5",
+  "version": "1.6.0",
   "description": "Hover over Magic: The Gathering card names to see current prices from multiple sources.",
   "browser_specific_settings": {
     "gecko": {
@@ -10,11 +10,14 @@
     }
   },
   "permissions": [
-    "storage"
+    "storage",
+    "alarms"
   ],
   "host_permissions": [
     "https://api.scryfall.com/*",
-    "https://open.er-api.com/*"
+    "https://open.er-api.com/*",
+    "https://tcgcsv.com/*",
+    "https://*.ingest.de.sentry.io/*"
   ],
   "background": {
     "scripts": [
@@ -30,19 +33,11 @@
         "https://shop.tcgplayer.com/*",
         "https://edhrec.com/*",
         "https://www.edhrec.com/*",
-        "https://www.moxfield.com/*",
-        "https://moxfield.com/*",
-        "https://archidekt.com/*",
-        "https://www.archidekt.com/*",
-        "https://www.mtggoldfish.com/*",
         "https://scryfall.com/*",
         "https://www.scryfall.com/*",
         "https://www.reddit.com/*",
         "https://old.reddit.com/*",
-        "https://reddit.com/*",
-        "https://mtg.fandom.com/*",
-        "https://tappedout.net/*",
-        "https://www.tappedout.net/*"
+        "https://reddit.com/*"
       ],
       "js": [
         "src/content.js"
@@ -65,5 +60,15 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "fonts/*.woff2"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
 }

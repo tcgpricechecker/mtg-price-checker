@@ -4,218 +4,420 @@
   <meta charset="UTF-8" />
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
+    input, button, select, textarea { font-family: inherit; }
+
+    /* ─── Font Loading ─── */
+    @font-face {
+      font-family: 'Cormorant Garamond';
+      font-weight: 700;
+      font-style: normal;
+      font-display: swap;
+      src: url('../fonts/CormorantGaramond-Bold.woff2') format('woff2');
+    }
+    @font-face {
+      font-family: 'Cormorant Garamond';
+      font-weight: 500;
+      font-style: normal;
+      font-display: swap;
+      src: url('../fonts/CormorantGaramond-Medium.woff2') format('woff2');
+    }
+
+    /* ═══════════════════════════════════════════
+       MTG PRICE CHECKER THEME
+       Neutral dark shell with card section
+       and price table below.
+       ═══════════════════════════════════════════ */
 
     body {
       width: 360px;
-      min-height: 200px;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: #1a1b26;
-      color: #c0caf5;
+      font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+      background: #101a1e;
+      color: #c2ccd2;
     }
 
-    /* Header */
+    /* ─── Header ─── */
     .header {
-      padding: 16px;
-      background: linear-gradient(135deg, #1e1f2e, #292a3e);
-      border-bottom: 1px solid #33354a;
+      padding: 10px 14px 8px;
+      background: #161d21;
+      border-bottom: 1px solid #24383c;
       text-align: center;
     }
 
     .header h1 {
-      font-size: 16px;
+      font-family: 'Cormorant Garamond', Georgia, 'Palatino Linotype', serif;
+      font-size: 15px;
       font-weight: 700;
-      color: #e0af68;
-      margin-bottom: 2px;
+      color: #c8d4d8;
+      margin-bottom: 1px;
+      letter-spacing: 0.3px;
     }
 
-    .header p {
-      font-size: 11px;
-      color: #565f89;
+    .header p { font-size: 10px; color: #4a6464; }
+
+    /* ─── Settings Bar ─── */
+    .settings-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 5px 14px;
+      background: #161d21;
+      border-bottom: 1px solid #24383c;
     }
 
-    /* Search */
-    .search-container {
-      padding: 12px 16px;
+    .settings-bar label { font-size: 11px; color: #649090; cursor: pointer; user-select: none; }
+    .toggle-switch { flex-shrink: 0; }
+    .toggle-switch label { position: relative; display: block; width: 34px; height: 18px; cursor: pointer; }
+    .toggle-switch input { opacity: 0; width: 0; height: 0; }
+
+    .toggle-slider {
+      position: absolute; inset: 0;
+      background: #24383c; border: 1px solid #2e4248;
+      border-radius: 9px; transition: background 0.2s;
     }
+    .toggle-slider::before {
+      content: ''; position: absolute;
+      width: 14px; height: 14px; left: 1px; bottom: 1px;
+      background: #4a6464; border-radius: 50%;
+      transition: transform 0.2s, background 0.2s;
+    }
+    .toggle-switch input:checked + .toggle-slider { background: #1a3a1a; border-color: #2a5a2a; }
+    .toggle-switch input:checked + .toggle-slider::before { transform: translateX(16px); background: #7ab648; }
+
+    /* ─── Search Area ─── */
+    .search-container { padding: 8px 12px; background: #161d21; }
 
     .search-input {
-      width: 100%;
-      padding: 10px 14px;
-      background: #24253a;
-      border: 1px solid #33354a;
-      border-radius: 8px;
-      color: #c0caf5;
-      font-size: 14px;
-      outline: none;
-      transition: border-color 0.2s;
+      width: 100%; padding: 9px 12px;
+      background: #1c282c; border: 1px solid #2e4248;
+      border-radius: 4px; color: #c8d4d8; font-size: 13px;
+      outline: none; transition: border-color 0.2s, box-shadow 0.2s;
     }
+    .search-input::placeholder { color: #3e5858; }
+    .search-input:focus { border-color: #486468; box-shadow: 0 0 0 1px rgba(100,100,120,0.2); }
 
-    .search-input::placeholder {
-      color: #565f89;
-    }
-
-    .search-input:focus {
-      border-color: #7aa2f7;
-    }
-
-    /* Suggestions */
+    /* ─── Suggestions ─── */
     .suggestions {
-      list-style: none;
-      max-height: 120px;
-      overflow-y: auto;
-      margin-top: 4px;
-    }
-
-    .suggestions li {
-      padding: 8px 14px;
-      cursor: pointer;
-      font-size: 13px;
+      list-style: none; max-height: 120px;
+      overflow-y: auto; margin-top: 4px;
+      background: #1c282c; border: 1px solid #2e4248;
       border-radius: 4px;
-      transition: background 0.1s;
     }
-
-    .suggestions li:hover {
-      background: #292a3e;
-      color: #e0af68;
+    .suggestions:empty { display: none; }
+    .suggestions li {
+      padding: 7px 12px; cursor: pointer;
+      font-size: 12px; color: #a0b4b8;
+      border-radius: 3px; transition: background 0.1s;
     }
+    .suggestions li:hover,
+    .suggestions li.selected { background: #243a3e; color: #c8d4d8; }
 
-    /* Result Card */
+    /* ─── Set Filter ─── */
+    .set-filter-row { display: flex; gap: 4px; margin-top: 5px; }
+    .set-input {
+      flex: 1; padding: 6px 10px;
+      background: #1c282c; border: 1px solid #2e4248;
+      border-radius: 4px; color: #c8d4d8; font-size: 11px;
+      outline: none; transition: border-color 0.2s;
+    }
+    .set-input::placeholder { color: #3e5858; }
+    .set-input:focus { border-color: #486468; }
+    .set-input:disabled { opacity: 0.4; cursor: not-allowed; }
+    .set-input.active { border-color: #3a7a2a; background: #1a2a1a; }
+
+    .set-clear {
+      background: #1c282c; border: 1px solid #2e4248;
+      border-radius: 4px; color: #4a6464; font-size: 12px;
+      padding: 0 7px; cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .set-clear:hover { color: #d05050; border-color: #d05050; }
+
+    .set-suggestions { max-height: 200px; }
+    .set-suggestions li .set-code { color: #3e5858; font-size: 10px; margin-left: 4px; }
+
+    /* ─── Loading ─── */
+    .loading {
+      text-align: center; padding: 20px;
+      color: #3e5858; font-size: 13px;
+      display: none; background: #161d21;
+    }
+    .loading.visible { display: block; }
+
+    /* ═══════════════════════════════════════════
+       RESULT CONTAINER
+       ═══════════════════════════════════════════ */
+
     .result {
-      padding: 0 16px 16px;
       display: none;
+      background: #161d21;
     }
-
     .result.visible { display: block; }
 
+    /* ═══════════════════════════════════════════
+       CARD ELEMENTS
+       ═══════════════════════════════════════════ */
+
+    /* ─── Card Header (image + info side by side) ─── */
+    .card-header {
+      display: flex;
+      flex-direction: row;
+      gap: 10px;
+      padding: 10px 14px;
+      border-bottom: 1px solid #24383c;
+      background: #1a2428;
+    }
+
     .card-image {
-      width: 100%;
-      max-width: 240px;
-      margin: 0 auto 12px;
-      display: block;
-      border-radius: 10px;
-      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+      width: 35%;
+      min-width: 80px;
+      max-width: 140px;
+      height: auto;
+      border-radius: 6px;
+      border: 1px solid #283a40;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+      flex-shrink: 0;
+    }
+
+    .card-info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+      justify-content: center;
     }
 
     .card-name {
-      font-size: 16px;
-      font-weight: 700;
-      color: #e0af68;
-      text-align: center;
-      margin-bottom: 2px;
+      font-family: 'Cormorant Garamond', Georgia, 'Palatino Linotype', serif;
+      font-size: 14px; font-weight: 700;
+      color: #e8d5a3;
+      line-height: 1.2;
     }
 
     .card-set {
-      font-size: 11px;
-      color: #7982a9;
-      text-align: center;
-      margin-bottom: 10px;
+      font-family: 'Cormorant Garamond', Georgia, 'Palatino Linotype', serif;
+      font-weight: 500;
+      font-size: 11px; color: #5a9ad0;
+    }
+    .card-type {
+      font-family: 'Cormorant Garamond', Georgia, 'Palatino Linotype', serif;
+      font-weight: 500;
+      font-size: 11px; color: #90acb0;
+    }
+
+    .printing-indicator {
+      font-size: 12px; color: #649090;
+      margin-top: 2px; user-select: none;
+    }
+
+    .printing-nav {
+      cursor: pointer; padding: 1px 5px; border-radius: 3px;
+      transition: color 0.15s, background 0.15s;
+    }
+    .printing-nav:hover {
+      color: #c8d4d8;
+      background: rgba(255,255,255,0.06);
+    }
+
+    /* ─── Oracle Text ─── */
+    .oracle-section { padding-bottom: 2px; border-top: 1px solid #24383c; }
+
+    .oracle-toggle {
+      font-size: 11px; color: #90b0b0;
+      padding: 6px 0; cursor: pointer; text-align: center;
+      user-select: none; transition: color 0.15s;
+    }
+    .oracle-toggle:hover { color: #c2ccd2; }
+
+    .oracle-text {
+      font-size: 11px; line-height: 1.5;
+      color: #c2ccd2;
+      white-space: pre-wrap;
+      padding: 0 4px 6px; display: none;
+      font-style: italic;
+    }
+    .oracle-text.expanded { display: block; }
+
+    /* ═══════════════════════════════════════════
+       TABLE SURFACE
+       Same neutral dark as header/search.
+       ═══════════════════════════════════════════ */
+    .table-surface {
+      background: #161d21;
+      padding: 10px 12px 6px;
+    }
+
+    .price-source {
+      grid-column: 1 / -1;
+      font-size: 11px; color: #649090;
+      font-weight: 600; text-align: center;
+      padding-bottom: 5px;
+      border-bottom: 1px solid #24383c;
+      margin-bottom: 6px;
+    }
+
+    .no-prices {
+      grid-column: 1 / -1;
+      font-size: 11px; color: #405458;
+      text-align: center; padding: 8px 0;
     }
 
     .price-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      margin-bottom: 12px;
+      gap: 5px;
+      margin-bottom: 8px;
     }
 
     .price-box {
-      background: #24253a;
-      border: 1px solid #33354a;
-      border-radius: 8px;
-      padding: 8px 10px;
-      text-align: center;
+      background: #1c282c;
+      border: 1px solid #24383c;
+      border-radius: 4px; padding: 5px 6px; text-align: center;
     }
 
     .price-box .label {
-      font-size: 10px;
-      color: #565f89;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
+      font-size: 9px; color: #587c82;
+      text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;
     }
 
     .price-box .value {
-      font-size: 18px;
-      font-weight: 700;
-      color: #9ece6a;
-      margin-top: 2px;
+      font-size: 15px; font-weight: 700;
+      color: #7ab648; margin-top: 1px;
     }
+    .price-box .value.high { color: #e06050; }
+    .price-box .value.medium { color: #d0b050; }
 
-    .price-box .value.high { color: #f7768e; }
-    .price-box .value.medium { color: #e0af68; }
-
+    /* ─── Links on table ─── */
     .links {
-      display: flex;
-      gap: 6px;
+      display: flex; flex-wrap: wrap; gap: 5px;
+      margin-bottom: 6px;
     }
 
     .links a {
-      flex: 1;
-      text-align: center;
-      padding: 6px;
-      font-size: 11px;
+      flex: 1 1 calc(50% - 4px); text-align: center;
+      padding: 5px 6px; font-size: 10px; font-weight: 600;
+      text-decoration: none; border-radius: 3px;
+      transition: all 0.15s ease; letter-spacing: 0.2px;
+      display: flex; align-items: center; justify-content: center; gap: 4px;
+    }
+
+    .links a svg { width: 14px; height: 14px; flex-shrink: 0; }
+
+    /* Scryfall — Blue */
+    .links a.link-scryfall {
+      color: #e0eef8;
+      background: #1e5a8a;
+      border: 1px solid #2a6a9e;
+    }
+    .links a.link-scryfall:hover { background: #246ca0; color: #ffffff; }
+
+    /* Cardmarket — White Mana */
+    .links a.link-cardmarket {
+      color: #3a3530;
+      background: #e8e0d0;
+      border: 1px solid #d0c8b8;
+    }
+    .links a.link-cardmarket:hover { background: #f0e8d8; color: #2a2520; }
+
+    /* TCGPlayer — Red Mana */
+    .links a.link-tcgplayer {
+      color: #ffffff;
+      background: #8a3828;
+      border: 1px solid #a04030;
+    }
+    .links a.link-tcgplayer:hover { background: #a04030; color: #ffffff; }
+
+    /* eBay — Black Mana */
+    .links a.link-ebay {
+      color: #a8a0b0;
+      background: #141018;
+      border: 1px solid #241e2a;
+    }
+    .links a.link-ebay:hover { background: #1e1824; color: #c8c0d0; }
+
+    /* Fallback */
+    .links a:not([class]) {
+      color: #5a7e82;
+      background: rgba(100,100,108,0.05);
+      border: 1px solid rgba(100,100,108,0.12);
+    }
+
+    /* ─── Support Footer ─── */
+    .support-footer {
+      padding: 6px 12px 8px; text-align: center;
+      border-top: 1px solid #24383c;
+    }
+
+    .support-footer a {
+      font-size: 11px; color: #d0f0c0;
+      text-decoration: none; transition: all 0.15s;
       font-weight: 600;
-      color: #7aa2f7;
-      text-decoration: none;
-      background: rgba(122, 162, 247, 0.08);
-      border: 1px solid rgba(122, 162, 247, 0.15);
-      border-radius: 6px;
-      transition: all 0.15s ease;
+      display: flex; align-items: center; justify-content: center; gap: 3px;
+      padding: 6px 12px;
+      background: #1a3c18;
+      border: 1px solid #2a5426;
+      border-radius: 4px;
+    }
+    .support-footer a svg {
+      width: 12px; height: 12px; flex-shrink: 0;
+    }
+    .support-footer a:hover {
+      color: #e8ffe0;
+      background: #244a20;
+      border-color: #2a5426;
     }
 
-    .links a:hover {
-      background: rgba(122, 162, 247, 0.18);
-    }
-
-    /* Loading */
-    .loading {
-      text-align: center;
-      padding: 20px;
-      color: #7982a9;
-      font-size: 13px;
-      display: none;
-    }
-
-    .loading.visible { display: block; }
-
-    /* Footer */
-    .footer {
-      padding: 10px;
-      text-align: center;
-      font-size: 10px;
-      color: #33354a;
-      border-top: 1px solid #24253a;
-    }
-
-    .footer a {
-      color: #565f89;
-      text-decoration: none;
-    }
-
-    .footer a:hover {
-      color: #7aa2f7;
-    }
-
-    .footer-sep {
-      margin: 0 6px;
-      color: #33354a;
-    }
-
-    .kofi-link:hover {
-      color: #e0af68;
-    }
-
-    /* Scrollbar */
+    /* ─── Scrollbar ─── */
     ::-webkit-scrollbar { width: 4px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: #33354a; border-radius: 2px; }
+    ::-webkit-scrollbar-thumb { background: #2e4248; border-radius: 2px; }
+
+    /* ─── Foil Badge (rainbow shimmer) ─── */
+    .mtg-foil-badge {
+      background: linear-gradient(
+        90deg, #ff6b6b, #feca57, #48dbfb, #ff9ff3, #54a0ff, #5f27cd, #ff6b6b
+      );
+      background-size: 200% 100%;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      animation: mtg-foil-shimmer 3s linear infinite;
+      font-weight: 600;
+    }
+
+    @keyframes mtg-foil-shimmer {
+      0% { background-position: 0% 50%; }
+      100% { background-position: 200% 50%; }
+    }
   </style>
 </head>
 <body>
+  <!-- ═══ HEADER ═══ -->
   <div class="header">
-    <h1>⚔️ MTG Price Checker</h1>
+    <h1>MTG Price Checker</h1>
     <p>Search any Magic: The Gathering card</p>
   </div>
 
+  <!-- ═══ SETTINGS ═══ -->
+  <div class="settings-bar">
+    <label for="hoverToggle">Hover Popup</label>
+    <div class="toggle-switch">
+      <label for="hoverToggle">
+        <input type="checkbox" id="hoverToggle" checked />
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+  </div>
+  <div class="settings-bar">
+    <label for="errorTrackingToggle">Error Reporting</label>
+    <div class="toggle-switch">
+      <label for="errorTrackingToggle">
+        <input type="checkbox" id="errorTrackingToggle" />
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <!-- ═══ SEARCH ═══ -->
   <div class="search-container">
     <input
       type="text"
@@ -225,22 +427,48 @@
       autocomplete="off"
     />
     <ul class="suggestions" id="suggestions"></ul>
+    <div class="set-filter-row">
+      <input
+        type="text"
+        class="set-input"
+        id="setInput"
+        placeholder="Filter by set (optional)"
+        autocomplete="off"
+      />
+      <button class="set-clear" id="setClear" style="display:none;" title="Clear set filter">✕</button>
+    </div>
+    <ul class="suggestions set-suggestions" id="setSuggestions"></ul>
   </div>
 
   <div class="loading" id="loading">Loading prices...</div>
 
+  <!-- ═══ RESULT ═══ -->
   <div class="result" id="result">
-    <img class="card-image" id="cardImage" src="" alt="" />
-    <div class="card-name" id="cardName"></div>
-    <div class="card-set" id="cardSet"></div>
-    <div class="price-grid" id="priceGrid"></div>
-    <div class="links" id="links"></div>
-  </div>
+    <!-- ── Card Header (image + info side by side) ── -->
+    <div class="card-header">
+      <img class="card-image" id="cardImage" src="" alt="" />
+      <div class="card-info">
+        <div class="card-name" id="cardName"></div>
+        <div class="card-type" id="cardType"></div>
+        <div class="card-set" id="cardSet"></div>
+        <div class="printing-indicator" id="printingIndicator" style="display:none;"></div>
+      </div>
+    </div>
 
-  <div class="footer">
-    Prices via <a href="https://scryfall.com" target="_blank">Scryfall API</a>
-    <span class="footer-sep">·</span>
-    <a href="https://ko-fi.com/tcgpricechecker" target="_blank" class="kofi-link">☕ Support</a>
+    <!-- ── Prices ── -->
+    <div class="table-surface">
+      <div class="price-grid" id="priceGrid"></div>
+
+      <div class="oracle-section" id="oracleSection" style="display:none;">
+        <div class="oracle-toggle" id="oracleToggle">Card Text ▾</div>
+        <div class="oracle-text" id="oracleText"></div>
+      </div>
+
+      <div class="links" id="links"></div>
+      <div class="support-footer">
+        <a href="https://ko-fi.com/tcgpricechecker" target="_blank"><svg viewBox="0 0 12 12" fill="currentColor" style="width:12px;height:12px;vertical-align:-1px;margin-right:2px;"><path d="M6 1C4 3 2 5 3.5 7L5.2 7L5.2 11L6.8 11L6.8 7L8.5 7C10 5 8 3 6 1Z"/></svg>Support this project</a>
+      </div>
+    </div>
   </div>
 
   <script src="popup.js"></script>

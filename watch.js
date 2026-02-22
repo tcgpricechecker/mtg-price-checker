@@ -117,6 +117,17 @@ function extractZip(zipPath) {
       
       log(`✅ Copied ${copied} files from ZIP → shared/src/`);
       
+      // Also check for browser-specific manifests (chrome/, firefox/, edge/)
+      const extractRoot = path.dirname(path.dirname(sharedSrcPath)); // Go up from shared/src to root
+      for (const browser of ['chrome', 'firefox', 'edge']) {
+        const manifestSrc = path.join(extractRoot, browser, 'manifest.json');
+        const manifestDest = path.join(__dirname, browser, 'manifest.json');
+        if (fs.existsSync(manifestSrc)) {
+          fs.copyFileSync(manifestSrc, manifestDest);
+          log(`📄 Updated ${browser}/manifest.json`);
+        }
+      }
+      
       // Also check for shared/icons
       const sharedIconsPath = sharedSrcPath.replace(/src$/, 'icons');
       if (fs.existsSync(sharedIconsPath)) {
@@ -209,7 +220,7 @@ function findPackageJson(dir) {
       return fullPath;
     }
     
-    if (entry.isDirectory()) {
+    if (entry.isDirectory() && entry.name !== 'node_modules') {
       const found = findPackageJson(fullPath);
       if (found) return found;
     }
