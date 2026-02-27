@@ -1,6 +1,6 @@
 {
   "name": "mtg-price-checker",
-  "version": "1.7.1",
+  "version": "1.7.2",
   "description": "MTG Card Price Checker - Browser Extension",
   "private": true,
   "scripts": {
