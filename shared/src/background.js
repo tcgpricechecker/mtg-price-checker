@@ -20,6 +20,20 @@ const SENTRY_KEY = '688c325cc3bafb816f252807c6348269';
 const SENTRY_HOST = 'o4510896101720064.ingest.de.sentry.io';
 const EXTENSION_VERSION = chrome.runtime.getManifest().version;
 
+// ═══════════════════════════════════════════
+// UPDATE BADGE ("NEW" on extension icon)
+// ═══════════════════════════════════════════
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === 'update' || details.reason === 'install') {
+    chrome.storage.local.get('lastSeenVersion', (data) => {
+      if (data.lastSeenVersion !== EXTENSION_VERSION) {
+        chrome.action.setBadgeText({ text: 'NEW' });
+        chrome.action.setBadgeBackgroundColor({ color: '#5a9ad0' });
+      }
+    });
+  }
+});
+
 // Opt-in guard: Sentry only active if user explicitly enabled it
 async function isSentryEnabled() {
   const data = await chrome.storage.local.get('errorTrackingEnabled');

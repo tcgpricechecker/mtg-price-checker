@@ -464,7 +464,7 @@ function renderResult(data) {
   const linksEl = document.getElementById('links');
   const links = [];
   if (data.links.scryfall) links.push(`<a href="${escapeHtml(data.links.scryfall)}" target="_blank" class="link-scryfall">${MANA_ICONS.droplet} Scryfall</a>`);
-  if (data.links.cardmarket) links.push(`<a href="${escapeHtml(data.links.cardmarket)}" target="_blank" class="link-cardmarket">${MANA_ICONS.star} Cardmarket</a>`);
+  if (data.links.cardmarket) links.push(`<a href="${escapeHtml(applySellerCountry(data.links.cardmarket))}" target="_blank" class="link-cardmarket">${MANA_ICONS.star} Cardmarket</a>`);
   if (data.links.tcgplayer) links.push(`<a href="${escapeHtml(data.links.tcgplayer)}" target="_blank" class="link-tcgplayer">${MANA_ICONS.flame} TCGPlayer</a>`);
   if (data.links.ebay) links.push(`<a href="${escapeHtml(data.links.ebay)}" target="_blank" class="link-ebay">${MANA_ICONS.skull} eBay</a>`);
   linksEl.innerHTML = links.join('');
@@ -513,6 +513,141 @@ function capitalize(str) {
   // Save on change
   toggle.addEventListener('change', () => {
     chrome.storage.local.set({ errorTrackingEnabled: toggle.checked });
+  });
+})();
+
+// ─── SELLER COUNTRY (Cardmarket filter) ───
+let sellerCountry = '';
+
+function applySellerCountry(url) {
+  if (!url || !sellerCountry) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return url + sep + 'sellerCountry=' + sellerCountry;
+}
+
+(function initSellerCountry() {
+  const select = document.getElementById('sellerCountrySelect');
+  if (!select) return;
+
+  chrome.storage.local.get('sellerCountry', (data) => {
+    if (data.sellerCountry) {
+      sellerCountry = data.sellerCountry;
+      select.value = sellerCountry;
+    }
+  });
+
+  select.addEventListener('change', () => {
+    sellerCountry = select.value;
+    chrome.storage.local.set({ sellerCountry: sellerCountry });
+  });
+})();
+
+// ─── SETTINGS FLIP ANIMATION ───
+(function initSettingsFlip() {
+  const container = document.getElementById('flipContainer');
+  const inner = document.getElementById('flipInner');
+  const settingsBtn = document.getElementById('settingsBtn');
+  const backBtn = document.getElementById('backBtn');
+  if (!container || !inner || !settingsBtn || !backBtn) return;
+
+  const front = container.querySelector('.flip-front');
+  const back = container.querySelector('.flip-back');
+
+  function flipTo(side) {
+    if (side === 'back') {
+      // Show back face before measuring
+      back.style.display = '';
+
+      const frontHeight = front.offsetHeight;
+      inner.style.height = frontHeight + 'px';
+      inner.offsetHeight; // force reflow
+
+      container.classList.add('flipped');
+
+      requestAnimationFrame(() => {
+        const backPage = back.querySelector('.settings-page');
+        inner.style.height = (backPage ? backPage.offsetHeight : 200) + 'px';
+      });
+    } else {
+      const frontHeight = front.offsetHeight;
+
+      container.classList.remove('flipped');
+
+      requestAnimationFrame(() => {
+        inner.style.height = frontHeight + 'px';
+      });
+
+      inner.addEventListener('transitionend', function handler(e) {
+        if (e.propertyName === 'transform') {
+          inner.style.height = '';
+          back.style.display = 'none'; // hide back so it doesn't affect popup sizing
+          inner.removeEventListener('transitionend', handler);
+        }
+      });
+    }
+  }
+
+  settingsBtn.addEventListener('click', () => flipTo('back'));
+  backBtn.addEventListener('click', () => flipTo('front'));
+
+  // Hide back face initially so Chrome sizes popup only for front content
+  back.style.display = 'none';
+
+  // Set version dynamically from manifest
+  const versionEl = document.querySelector('.settings-version');
+  if (versionEl && chrome.runtime.getManifest) {
+    const version = chrome.runtime.getManifest().version;
+    versionEl.textContent = 'MTG Price Checker v' + version;
+  }
+})();
+
+// ─── WHAT'S NEW / SUPPORT FOOTER ───
+(function initFooter() {
+  const link = document.getElementById('footerLink');
+  if (!link || !chrome.runtime.getManifest) return;
+
+  const WHATS_NEW_DAYS = 7;
+  const version = chrome.runtime.getManifest().version;
+  const kofiUrl = 'https://ko-fi.com/tcgpricechecker';
+  const supportIcon = '<svg viewBox="0 0 12 12" fill="currentColor" style="width:12px;height:12px;vertical-align:-1px;margin-right:2px;"><path d="M6 1C4 3 2 5 3.5 7L5.2 7L5.2 11L6.8 11L6.8 7L8.5 7C10 5 8 3 6 1Z"/></svg>';
+  // Sparkle icon for "What's new"
+  const sparkleIcon = '<svg viewBox="0 0 12 12" fill="currentColor" style="width:12px;height:12px;vertical-align:-1px;margin-right:2px;"><path d="M6 0L7.2 4.2L11.5 4.5L8.1 7.2L9.2 11.5L6 9L2.8 11.5L3.9 7.2L0.5 4.5L4.8 4.2Z"/></svg>';
+
+  function showSupport() {
+    link.innerHTML = supportIcon + 'Support this project';
+    link.href = kofiUrl;
+    link.classList.remove('whats-new');
+  }
+
+  function showWhatsNew() {
+    link.innerHTML = sparkleIcon + "What's new in v" + version;
+    link.href = kofiUrl;
+    link.classList.add('whats-new');
+  }
+
+  chrome.storage.local.get(['lastSeenVersion', 'updateDetectedAt'], (data) => {
+    const now = Date.now();
+
+    // Clear badge whenever popup is opened
+    try { chrome.action.setBadgeText({ text: '' }); } catch (e) { /* Firefox compat */ }
+
+    if (data.lastSeenVersion !== version) {
+      // New version detected
+      chrome.storage.local.set({
+        lastSeenVersion: version,
+        updateDetectedAt: now,
+      });
+      showWhatsNew();
+    } else if (data.updateDetectedAt) {
+      const daysSince = (now - data.updateDetectedAt) / (1000 * 60 * 60 * 24);
+      if (daysSince < WHATS_NEW_DAYS) {
+        showWhatsNew();
+      } else {
+        showSupport();
+      }
+    } else {
+      showSupport();
+    }
   });
 })();
 

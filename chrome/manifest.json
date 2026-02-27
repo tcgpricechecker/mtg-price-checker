@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MTG Card Price Checker",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Hover over Magic: The Gathering card names to see current prices from multiple sources.",
   "permissions": [
     "storage",

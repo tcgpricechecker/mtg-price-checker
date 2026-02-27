@@ -64,11 +64,36 @@
 
   let userCurrency = 'USD';
   let exchangeRate = 1;
+  let sellerCountry = '';
 
   function detectCurrency() {
     const lang = navigator.language || navigator.userLanguage || 'en-US';
     userCurrency = LOCALE_TO_CUR[lang] || LOCALE_TO_CUR[lang.split('-')[0]] || 'USD';
     log('Locale:', lang, '→', userCurrency);
+  }
+
+  function loadSellerCountry() {
+    try {
+      chrome.storage.local.get('sellerCountry', (data) => {
+        if (data.sellerCountry) {
+          sellerCountry = data.sellerCountry;
+          log('Seller country:', sellerCountry);
+        }
+      });
+      // Listen for changes from settings page
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area === 'local' && changes.sellerCountry) {
+          sellerCountry = changes.sellerCountry.newValue || '';
+          log('Seller country updated:', sellerCountry);
+        }
+      });
+    } catch (e) { /* extension context may be invalidated */ }
+  }
+
+  function applySellerCountry(url) {
+    if (!url || !sellerCountry) return url;
+    const sep = url.includes('?') ? '&' : '?';
+    return url + sep + 'sellerCountry=' + sellerCountry;
   }
 
   async function loadExchangeRate() {
@@ -416,6 +441,7 @@
     } catch (e) {
       // Extension context may not be available (e.g. during page unload)
     }    detectCurrency();
+    loadSellerCountry();
     loadExchangeRate();
     createPopup();
 
@@ -971,7 +997,9 @@
     for (const [cls, key] of [['scryfall','scryfall'],['cardmarket','cardmarket'],['tcgplayer','tcgplayer'],['ebay','ebay']]) {
       const a = $('.mtg-link-' + cls);
       if (a) {
-        a.href = data.links[key] || '#';
+        let url = data.links[key] || '#';
+        if (key === 'cardmarket' && url !== '#') url = applySellerCountry(url);
+        a.href = url;
         a.style.display = data.links[key] ? '' : 'none';
       }
     }
