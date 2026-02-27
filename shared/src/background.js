@@ -34,6 +34,12 @@ chrome.runtime.onInstalled.addListener((details) => {
   }
 });
 
+// Ensure background is active on browser startup (Firefox event page needs this)
+chrome.runtime.onStartup.addListener(() => {
+  // No-op — registering this listener ensures Firefox starts the event page on browser launch.
+  // The persistCache alarm (below) then keeps it alive.
+});
+
 // Opt-in guard: Sentry only active if user explicitly enabled it
 async function isSentryEnabled() {
   const data = await chrome.storage.local.get('errorTrackingEnabled');
@@ -360,6 +366,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Only accept messages from our own extension
   if (sender.id !== chrome.runtime.id) return;
 
+  if (msg.type === 'PING') {
+    sendResponse({ pong: true });
+    return;
+  }
   if (msg.type === 'FETCH_CARD_PRICE') {
     handleLookup(msg).then(sendResponse);
     return true;

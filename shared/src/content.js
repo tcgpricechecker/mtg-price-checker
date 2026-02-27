@@ -9,6 +9,62 @@
   // ─── DEBUG LOGGING ───
   const log = (...a) => console.log('[MTG-PC]', ...a);
 
+  // ─── SERVICE WORKER MESSAGING ───
+  // Firefox MV3: background event page may be inactive when content script loads.
+  // chrome.runtime.sendMessage() silently fails if nobody is listening.
+  // Solution: Wake the background with a port connection + PING before first use.
+
+  let backgroundReady = false;
+
+  async function wakeBackground() {
+    if (backgroundReady) return true;
+    for (let i = 0; i < 5; i++) {
+      try {
+        const res = await chrome.runtime.sendMessage({ type: 'PING' });
+        if (res?.pong) {
+          backgroundReady = true;
+          log('Background ready');
+          return true;
+        }
+      } catch (e) {
+        // Connection failed — background not yet alive
+      }
+      // Open and close a port to force Firefox to start the background script
+      try {
+        const port = chrome.runtime.connect({ name: 'wake' });
+        port.disconnect();
+      } catch (e) { /* ignore */ }
+      await new Promise(r => setTimeout(r, 200 * (i + 1)));
+    }
+    log('Background failed to wake after retries');
+    return false;
+  }
+
+  async function sendMessage(msg, retries = 2) {
+    if (!backgroundReady) await wakeBackground();
+    for (let i = 0; i <= retries; i++) {
+      try {
+        const res = await chrome.runtime.sendMessage(msg);
+        if (res === undefined && i < retries) {
+          // Firefox may return undefined if background went back to sleep
+          log('Empty response, retrying...', i + 1);
+          backgroundReady = false;
+          await wakeBackground();
+          continue;
+        }
+        return res;
+      } catch (e) {
+        if (i < retries) {
+          log('Background not ready, retrying...', i + 1);
+          backgroundReady = false;
+          await wakeBackground();
+        } else {
+          throw e;
+        }
+      }
+    }
+  }
+
   // ─── STATE ───
   let popup = null;              // The popup DOM element
   let currentCard = null;        // JSON key of the currently displayed card (prevents stale renders)
@@ -99,7 +155,7 @@
   async function loadExchangeRate() {
     if (userCurrency === 'USD') return;
     try {
-      const res = await chrome.runtime.sendMessage({ type: 'GET_EXCHANGE_RATE', currency: userCurrency });
+      const res = await sendMessage({ type: 'GET_EXCHANGE_RATE', currency: userCurrency });
       if (res?.rate) {
         exchangeRate = res.rate;
         log('Rate: 1 USD =', exchangeRate, userCurrency);
@@ -810,7 +866,7 @@
         : Promise.resolve(null);
 
       // Send lookup — with cardmarketProductId if available for direct match
-      const res = await chrome.runtime.sendMessage({
+      const res = await sendMessage({
         type: 'FETCH_CARD_PRICE',
         cardName: info.name,
         tcgplayerId: info.tcgplayerId || null,
@@ -843,7 +899,7 @@
       const cmProductId = await cmIdPromise;
       if (requestGeneration !== gen || !cmProductId) return;
 
-      const refined = await chrome.runtime.sendMessage({
+      const refined = await sendMessage({
         type: 'FETCH_CARD_PRICE',
         cardName: info.name,
         cardmarketProductId: cmProductId
@@ -1235,6 +1291,9 @@
     // ─── ALL POPUP CSS ENCAPSULATED IN SHADOW DOM ───
     const style = document.createElement('style');
     style.textContent = `
+      /* ─── Utility ─── */
+      .hidden { display: none; }
+
       /* ─── Host Element (positioning, visibility) ─── */
       :host {
         position: fixed;
@@ -1617,6 +1676,12 @@
         border-color: #2a5426;
       }
 
+      .mtg-popup-footer a svg {
+        width: 12px;
+        height: 12px;
+        flex-shrink: 0;
+      }
+
       /* ─── Foil Badge with Rainbow Effect ─── */
       .mtg-foil-badge {
         display: inline-block;
@@ -1649,7 +1714,7 @@
           '<span class="mtg-drag-dots">☰</span>' +
         '</div>' +
         '<div class="mtg-popup-loading"><div class="mtg-spinner"></div><span>Loading...</span></div>' +
-        '<div class="mtg-popup-content" style="display:none;">' +
+        '<div class="mtg-popup-content hidden">' +
           '<div class="mtg-popup-header">' +
             '<img class="mtg-popup-image" src="" alt="" />' +
             '<div class="mtg-popup-info">' +
@@ -1665,7 +1730,7 @@
             '<div class="mtg-price-row mtg-row-market"><span class="mtg-price-label">Sold</span><span class="mtg-price-value" data-price="market"></span></div>' +
             '<div class="mtg-price-row mtg-row-foil"><span class="mtg-price-label"><span class="mtg-foil-badge">Foil</span></span><span class="mtg-price-value" data-price="foil"></span></div>' +
           '</div>' +
-          '<div class="mtg-popup-oracle-section" style="display:none;">' +
+          '<div class="mtg-popup-oracle-section hidden">' +
             '<div class="mtg-popup-oracle-toggle">Card Text ▼</div>' +
             '<div class="mtg-popup-oracle"></div>' +
           '</div>' +
@@ -1676,10 +1741,10 @@
             '<a class="mtg-link-ebay" href="#" target="_blank" rel="noopener"><svg viewBox="0 0 12 12" fill="currentColor"><path d="M6 1C3.5 1 2 2.8 2 5C2 6.5 2.8 7.8 4 8.3L4 10.5L5 9.5L6 10.5L7 9.5L8 10.5L8 8.3C9.2 7.8 10 6.5 10 5C10 2.8 8.5 1 6 1ZM4.5 5.5C4.5 4.9 5 4.5 5 4.5C5 4.5 4 5 4 5.8C3.8 5.2 4.2 4.5 4.8 4.2C4.3 4.8 4.5 5.5 4.5 5.5ZM4 6C3.6 6 3.3 5.6 3.3 5.2C3.3 4.8 3.6 4.4 4 4.4C4.4 4.4 4.7 4.8 4.7 5.2C4.7 5.6 4.4 6 4 6ZM8 6C7.6 6 7.3 5.6 7.3 5.2C7.3 4.8 7.6 4.4 8 4.4C8.4 4.4 8.7 4.8 8.7 5.2C8.7 5.6 8.4 6 8 6Z"/></svg> eBay</a>' +
           '</div>' +
           '<div class="mtg-popup-footer">' +
-            '<a href="https://ko-fi.com/tcgpricechecker" target="_blank" rel="noopener"><svg viewBox="0 0 12 12" fill="currentColor" style="width:12px;height:12px;vertical-align:-1px;margin-right:2px;"><path d="M6 1C4 3 2 5 3.5 7L5.2 7L5.2 11L6.8 11L6.8 7L8.5 7C10 5 8 3 6 1Z"/></svg>Support this project</a>' +
+            '<a href="https://ko-fi.com/tcgpricechecker" target="_blank" rel="noopener"><svg viewBox="0 0 12 12" fill="currentColor"><path d="M6 1C4 3 2 5 3.5 7L5.2 7L5.2 11L6.8 11L6.8 7L8.5 7C10 5 8 3 6 1Z"/></svg>Support this project</a>' +
           '</div>' +
         '</div>' +
-        '<div class="mtg-popup-error" style="display:none;"><span></span></div>' +
+        '<div class="mtg-popup-error hidden"><span></span></div>' +
         '<div class="mtg-popup-resize-grip"></div>';
 
     shadowRoot.appendChild(style);
